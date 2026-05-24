@@ -1,0 +1,56 @@
+{
+  "name": "alice_sso",
+  "description": "Canonical Phase-0 eval. One fixture exercises all three differentiators at once: contradiction->current-state, recall_as_of, and honest-empty. Phase 0 is DONE when all three cases pass.",
+  "today": "2026-05-21",
+
+  "seed": [
+    {
+      "occurred_at": "2026-03-10T15:00:00Z",
+      "speaker": "user",
+      "content": "Had the integration call with Alice today. She confirmed her team will hit the SSO deadline."
+    },
+    {
+      "occurred_at": "2026-05-12T09:30:00Z",
+      "speaker": "user",
+      "content": "Caught up with Alice - she now says they can't make the SSO deadline; the integration slipped."
+    }
+  ],
+
+  "cases": [
+    {
+      "id": "current-state",
+      "verb": "recall",
+      "query": "Did Alice agree to the SSO deadline?",
+      "expect": {
+        "answer": "no",
+        "current_as_of": "2026-05-12",
+        "cite_interaction_occurred_at": "2026-05-12T09:30:00Z",
+        "quote_contains": "can't make the SSO deadline",
+        "rationale": "Must return the CURRENT state (refused), not the superseded March agreement. The May fact superseded the March fact. Verbatim-anchored to the May interaction."
+      }
+    },
+    {
+      "id": "recall-as-of",
+      "verb": "recall_as_of",
+      "query": "Did Alice agree to the SSO deadline?",
+      "as_of": "2026-04-01T00:00:00Z",
+      "expect": {
+        "answer": "yes",
+        "current_as_of": "2026-03-10",
+        "cite_interaction_occurred_at": "2026-03-10T15:00:00Z",
+        "quote_contains": "will hit the SSO deadline",
+        "rationale": "As of April 1 the agreement was still valid (valid_from 2026-03-10, valid_until 2026-05-12). Must return YES anchored to the March interaction - the differentiator GBrain can't cheaply give."
+      }
+    },
+    {
+      "id": "honest-empty",
+      "verb": "recall",
+      "query": "Did Carol approve the Q3 budget?",
+      "expect": {
+        "answer": "honest-empty",
+        "fabricate": false,
+        "rationale": "Nothing about Carol or a Q3 budget is in the store. The keyword/FTS scan over verbatim returns nothing -> calibrated no-evidence. Must never invent an answer."
+      }
+    }
+  ]
+}

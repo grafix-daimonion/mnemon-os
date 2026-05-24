@@ -1,0 +1,59 @@
+{
+  "name": "adversarial",
+  "description": "Stress cases beyond the happy path. Each targets a specific failure mode: paraphrased-topic reversal (judge must match topics worded differently), multi-valued accumulation (must NOT supersede), re-confirmation (must NOT register a false reversal), and subject isolation (one person's reversal must not touch another's facts).",
+  "today": "2026-05-21",
+
+  "seed": [
+    { "occurred_at": "2026-03-01T10:00:00Z", "speaker": "user", "content": "Bob said the API migration will be done by Q2." },
+    { "occurred_at": "2026-02-01T10:00:00Z", "speaker": "user", "content": "Dana attended the Q1 kickoff." },
+    { "occurred_at": "2026-02-08T10:00:00Z", "speaker": "user", "content": "Dana attended the security review." },
+    { "occurred_at": "2026-01-05T10:00:00Z", "speaker": "user", "content": "Eve committed to leading the onboarding redesign." },
+    { "occurred_at": "2026-02-05T10:00:00Z", "speaker": "user", "content": "Eve is still fully on board with leading the onboarding redesign." },
+    { "occurred_at": "2026-04-20T10:00:00Z", "speaker": "user", "content": "Bob now thinks they won't finish the API rollout in time." }
+  ],
+
+  "cases": [
+    {
+      "id": "paraphrase-reversal-current",
+      "verb": "recall",
+      "query": "Will Bob finish the API migration on time?",
+      "expect": {
+        "answer": "no",
+        "cite_interaction_occurred_at": "2026-04-20T10:00:00Z",
+        "rationale": "'API rollout' (Apr) must be recognized as the same topic as 'API migration' (Mar) and supersede it. Tests the judge across paraphrase."
+      }
+    },
+    {
+      "id": "paraphrase-reversal-asof",
+      "verb": "recall_as_of",
+      "query": "Will Bob finish the API migration on time?",
+      "as_of": "2026-03-15T00:00:00Z",
+      "expect": {
+        "answer": "yes",
+        "cite_interaction_occurred_at": "2026-03-01T10:00:00Z",
+        "rationale": "As of mid-March the Q2 commitment was still valid."
+      }
+    },
+    {
+      "id": "multi-accumulates",
+      "check": "open_fact_count",
+      "subject": "Dana",
+      "expect": 2,
+      "rationale": "Two meetings attended; both must remain open. A list accumulates."
+    },
+    {
+      "id": "multi-no-supersede",
+      "check": "superseded_count",
+      "subject": "Dana",
+      "expect": 0,
+      "rationale": "Attending a second meeting must NOT cancel the first."
+    },
+    {
+      "id": "reconfirm-no-false-reversal",
+      "check": "superseded_count",
+      "subject": "Eve",
+      "expect": 0,
+      "rationale": "Re-stating the same commitment is not a reversal; nothing should be superseded."
+    }
+  ]
+}

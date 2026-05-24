@@ -1,0 +1,13 @@
+{
+  "name": "mnemon-os",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "eval": "bun run run-eval.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.98.0",
+    "@electric-sql/pglite": "^0.4.5"
+  }
+}
