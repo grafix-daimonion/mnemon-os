@@ -8,6 +8,8 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.98.0",
-    "@electric-sql/pglite": "^0.4.5"
+    "@electric-sql/pglite": "^0.4.5",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^4.4.3"
   }
 }
