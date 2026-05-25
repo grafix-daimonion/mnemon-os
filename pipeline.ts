@@ -12,6 +12,7 @@ import { contradicts, type Fact } from "./synapsis/resolve.ts";
 import { logEvent } from "./logger.ts";
 import { chunkText } from "./chunk.ts";
 import { embed, toVector } from "./embed.ts";
+import { faithful, sourceHash } from "./synapsis/verify.ts";
 
 export interface Interaction {
   content: string;
@@ -110,21 +111,31 @@ export async function ingest(db: PGlite, it: Interaction, opts: IngestOpts = {})
       objectLiteral = String(ex.object);
     }
 
-    // 5. persist (bi-temporal stamp + provenance)
+    // 5. persist as PROVISIONAL (+ source_hash for drift detection). Not trusted until QA passes.
     const factIns = await db.query<{ id: number }>(
-      `insert into facts (subject_id, predicate, object_entity_id, object_literal, shape, valid_from, source_interaction_id, source_span)
-       values ($1, $2, $3, $4, $5, $6, $7, $8) returning id`,
-      [subjectId, ex.predicate, objectEntityId, objectLiteral, shape, it.occurred_at, interactionId, ex.source_span ?? null]);
+      `insert into facts (subject_id, predicate, object_entity_id, object_literal, shape, valid_from, source_interaction_id, source_span, source_hash, status)
+       values ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'provisional') returning id`,
+      [subjectId, ex.predicate, objectEntityId, objectLiteral, shape, it.occurred_at, interactionId, ex.source_span ?? null, sourceHash(ex.source_span ?? String(ex.object))]);
     const incoming: Fact = {
       id: factIns.rows[0].id, subjectId, subjectLabel: String(ex.subject),
       predicate: ex.predicate, object: String(ex.object), shape, validFrom: it.occurred_at,
     };
 
-    // 6. contradiction -> current-state: close any open fact this one supersedes
+    // 5b. QA — faithfulness cross-check vs the verbatim. Verify, don't trust.
+    const v = await faithful({ subject: String(ex.subject), predicate: ex.predicate, object: String(ex.object) }, it.content);
+    logEvent("qa", { fact_id: incoming.id, subject: ex.subject, predicate: ex.predicate, object: ex.object, supported: v.ok, reason: v.reason });
+    if (!v.ok) {
+      await db.query(`update facts set status = 'quarantined' where id = $1`, [incoming.id]);
+      if (!process.env.MNEMON_QUIET) console.log(`  ⚠ quarantined #${incoming.id} ("${ex.object}") — ${v.reason}`);
+      continue; // quarantined facts never drive current-state
+    }
+    await db.query(`update facts set status = 'confirmed' where id = $1`, [incoming.id]);
+
+    // 6. contradiction -> current-state: close any open CONFIRMED fact this one supersedes
     const open = await db.query<any>(
       `select f.id, f.predicate, f.object_literal, oe.label as object_entity_label, f.shape, f.valid_from
        from facts f left join entities oe on oe.id = f.object_entity_id
-       where f.subject_id = $1 and f.valid_until is null and f.id <> $2`,
+       where f.subject_id = $1 and f.valid_until is null and f.status = 'confirmed' and f.id <> $2`,
       [subjectId, incoming.id]);
     for (const row of open.rows) {
       const existing: Fact = {

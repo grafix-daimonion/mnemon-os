@@ -71,7 +71,7 @@ async function selectFacts(db: PGlite, subject: string, asOf: string | null): Pr
      join entities sj on sj.id = f.subject_id
      join interactions i on i.id = f.source_interaction_id
      left join entities oe on oe.id = f.object_entity_id
-     where f.subject_id in (select id from scope) and ${asOfClause}
+     where f.subject_id in (select id from scope) and f.status = 'confirmed' and ${asOfClause}
      order by f.valid_from desc`, params);
   return res.rows.map((r) => ({ ...r, object_display: r.object_literal ?? r.object_entity_label }));
 }
