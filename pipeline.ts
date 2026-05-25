@@ -13,6 +13,7 @@ import { logEvent } from "./logger.ts";
 import { chunkText } from "./chunk.ts";
 import { embed, toVector } from "./embed.ts";
 import { faithful, sourceHash } from "./synapsis/verify.ts";
+import { buildDiary } from "./diary.ts";
 
 export interface Interaction {
   content: string;
@@ -158,6 +159,8 @@ export async function ingest(db: PGlite, it: Interaction, opts: IngestOpts = {})
       }
     }
   }
+  // L5: rebuild the day's Diary from CONFIRMED facts (deterministic, lossless, heavy-refs).
+  await buildDiary(db, it.occurred_at);
   } catch (e) {
     logEvent("ingest.extract_failed", { interaction_id: interactionId, error: String(e) });
   }

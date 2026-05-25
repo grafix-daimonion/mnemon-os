@@ -1,6 +1,7 @@
 // browse.ts — dump the graph in a file-backed store, so you can SEE what extraction built.
 //   bun run browse.ts [--data DIR]
 import { initDb } from "./db.ts";
+import { readDiary } from "./diary.ts";
 
 const i = process.argv.indexOf("--data");
 const dataDir = i >= 0 ? process.argv[i + 1] : "./data/sample";
@@ -28,5 +29,8 @@ console.log(`Superseded facts: ${sup}`);
 
 const ch = (await db.query<{ n: number; w: number }>(`select count(*)::int n, count(embedding)::int w from chunks`)).rows[0];
 console.log(`CHUNKS: ${ch.n} (embedded: ${ch.w})`);
+
+console.log("\nDIARY (recent, heavy-refs — confirmed current-state):");
+console.log(await readDiary(db, 5));
 
 await db.close();
