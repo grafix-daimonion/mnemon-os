@@ -10,6 +10,7 @@ import type { PGlite } from "@electric-sql/pglite";
 import { extractFacts } from "./extract.ts";
 import { contradicts, type Fact } from "./synapsis/resolve.ts";
 import { logEvent } from "./logger.ts";
+import { chunkText } from "./chunk.ts";
 
 export interface Interaction {
   content: string;
@@ -64,6 +65,12 @@ export async function ingest(db: PGlite, it: Interaction, opts: IngestOpts = {})
     `insert into interactions (content, speaker, occurred_at) values ($1, $2, $3) returning id`,
     [it.content, it.speaker, it.occurred_at]);
   const interactionId = ins.rows[0].id;
+
+  // 1b. L0 floor: chunk + store the verbatim (keyword-indexed now; embeddings filled by the embedder).
+  const pieces = chunkText(it.content);
+  for (let i = 0; i < pieces.length; i++)
+    await db.query(`insert into chunks (interaction_id, ord, content) values ($1, $2, $3)`,
+      [interactionId, i, pieces[i]]);
 
   // owner scope for this conversation's dependent entities (explicit; Ownership v2 §7.1)
   const accountId = opts.account

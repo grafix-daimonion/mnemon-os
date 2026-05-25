@@ -18,6 +18,17 @@ create table if not exists interactions (
   embedding    vector(384)                           -- local embedder; the vector half of hybrid recall
 );
 
+-- 1b. chunks — the L0 retrieval unit: a verbatim turn split into ~800-char windows (turn-aware).
+-- The floor everything else stands on; indexed keyword + vector so recall works with no clean subject.
+create table if not exists chunks (
+  id             bigserial   primary key,
+  interaction_id bigint      not null references interactions(id),
+  ord            int         not null default 0,        -- order within the interaction
+  content        text        not null,                  -- the chunk text (verbatim)
+  embedding      vector(384),                           -- local embedder; the vector half of L0 recall
+  created_at     timestamptz not null default now()
+);
+
 -- 2. entities — generic nodes (person/org/project/task/event/decision/fact/note/question + free labels).
 create table if not exists entities (
   id          bigserial primary key,
@@ -41,6 +52,9 @@ create table if not exists facts (
   -- provenance: every fact resolves to a source span (honest-empty rests on this).
   source_interaction_id bigint      not null references interactions(id),
   source_span           text,                                  -- the exact words this fact came from
+  source_chunk_id       bigint      references chunks(id),     -- finer provenance: the chunk (interaction stays the stable anchor)
+  source_hash           text,                                  -- hash of the source span → drift detection (E2 QA)
+  status                text        not null default 'confirmed', -- 'provisional'|'confirmed'|'quarantined' (E2 flips default → 'provisional')
   confidence            real        not null default 1.0,
   created_at            timestamptz not null default now()
 );
@@ -79,3 +93,13 @@ create index if not exists facts_current  on facts (subject_id, predicate) where
 
 -- recall_as_of windowing.
 create index if not exists facts_validity on facts (valid_from, valid_until);
+
+-- L0 chunk retrieval: keyword + vector over the chunked verbatim (the floor).
+create index if not exists chunks_fts on chunks using gin (to_tsvector('english', content));
+create index if not exists chunks_vec on chunks using hnsw (embedding vector_cosine_ops);
+create index if not exists chunks_interaction on chunks (interaction_id);
+
+-- Forward-compat for existing file-backed stores (no-op on fresh DBs; ALTERs run after chunks exists).
+alter table facts add column if not exists source_chunk_id bigint references chunks(id);
+alter table facts add column if not exists source_hash text;
+alter table facts add column if not exists status text not null default 'confirmed';

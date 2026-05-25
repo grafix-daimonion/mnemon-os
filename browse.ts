@@ -25,4 +25,8 @@ console.table((await db.query(
 
 const sup = (await db.query<{ n: number }>(`select count(*)::int n from facts where valid_until is not null`)).rows[0].n;
 console.log(`Superseded facts: ${sup}`);
+
+const ch = (await db.query<{ n: number; w: number }>(`select count(*)::int n, count(embedding)::int w from chunks`)).rows[0];
+console.log(`CHUNKS: ${ch.n} (embedded: ${ch.w})`);
+
 await db.close();
