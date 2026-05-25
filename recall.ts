@@ -24,6 +24,9 @@ export interface RecallResult {
   answer?: string;
   anchor?: string;
   source_occurred_at?: string;
+  // "fact" = current-state-resolved (the bi-temporal moat). "verbatim" = timestamped EVIDENCE from a
+  // chunk, NOT current-state-filtered — present it as "as of <date>…", may be superseded (Pythia QA-B).
+  via?: "fact" | "verbatim";
   reason?: string;
 }
 
@@ -170,7 +173,7 @@ async function run(db: PGlite, question: string, asOf: string | null): Promise<R
   const resolved = pick.index >= 0 && pick.index < facts.length && pick.answer && pick.answer !== "unknown";
   if (resolved) {
     const chosen = facts[pick.index];
-    return { type: "answer", answer: pick.answer, anchor: chosen.src_content, source_occurred_at: toISO(chosen.src_occurred_at) };
+    return { type: "answer", via: "fact", answer: pick.answer, anchor: chosen.src_content, source_occurred_at: toISO(chosen.src_occurred_at) };
   }
 
   // STEP 4 — L0 FLOOR: the fact layer didn't resolve. Fall back to the verbatim chunks.
@@ -181,7 +184,8 @@ async function run(db: PGlite, question: string, asOf: string | null): Promise<R
     logEvent("recall.floor_pick", { index: fa.index, answer: fa.answer });
     if (fa.index >= 0 && fa.index < chunks.length && fa.answer && fa.answer.toLowerCase() !== "unknown") {
       const c = chunks[fa.index];
-      return { type: "answer", answer: fa.answer, anchor: c.content, source_occurred_at: toISO(c.src_occurred_at) };
+      // floor answer = timestamped evidence, NOT current-state-resolved (no bi-temporal filter on chunks)
+      return { type: "answer", via: "verbatim", answer: fa.answer, anchor: c.content, source_occurred_at: toISO(c.src_occurred_at) };
     }
   }
   // ABSENCE verdict — decided by the CERTAIN keyword scan, never by vector noise (honest-empty spec).
