@@ -8,6 +8,22 @@ import { createHash } from "node:crypto";
 export const sourceHash = (s: string): string =>
   createHash("sha256").update((s ?? "").trim().toLowerCase()).digest("hex").slice(0, 16);
 
+// SAME-ENTITY: a fuzzy/semantic candidate matched an existing node by spelling or meaning —
+// confirm they denote the SAME real-world entity before merging. The guardrail on fuzzy's
+// false positives ("Pythia" vs "Python"): the LLM proposes, this gate confirms. Conservative.
+export async function sameEntity(
+  incoming: string, candidate: string, account: string | null,
+): Promise<{ ok: boolean; reason: string }> {
+  const j = await llmJSON(
+    `Two entity names from a memory system might refer to the SAME real-world thing — one may be a
+typo, abbreviation, or reworded variant of the other — OR they may be genuinely different things
+that merely look/sound alike. Return JSON {same: boolean, reason: string}.
+Be CONSERVATIVE: only say same=true if you are confident they denote the same specific entity.
+When unsure, say false — a wrong merge corrupts memory; a missed merge only duplicates it.`,
+    JSON.stringify({ name_a: incoming, name_b: candidate, account }));
+  return { ok: !!j?.same, reason: String(j?.reason ?? "") };
+}
+
 // FAITHFULNESS: is the fact actually supported by the source text (true to it, not invented/distorted)?
 export async function faithful(
   fact: { subject: string; predicate: string; object: string },

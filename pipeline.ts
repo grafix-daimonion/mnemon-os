@@ -12,7 +12,8 @@ import { contradicts, type Fact } from "./synapsis/resolve.ts";
 import { logEvent } from "./logger.ts";
 import { chunkText } from "./chunk.ts";
 import { embed, toVector } from "./embed.ts";
-import { faithful, sourceHash } from "./synapsis/verify.ts";
+import { faithful, sourceHash, sameEntity } from "./synapsis/verify.ts";
+import { osaDistance, normLabel, fuzzyCap } from "./synapsis/fuzzy.ts";
 import { buildDiary } from "./diary.ts";
 
 export interface Interaction {
@@ -30,35 +31,74 @@ const toISO = (v: any): string => (v instanceof Date ? v.toISOString() : new Dat
 const INDEPENDENT = new Set(["person", "org"]);
 const OWNERSHIP_PREDS = ["has", "owns", "part of", "runs", "leads", "member of"];
 
-// Resolve a mention to a node, kind-dependently. ownerId scopes DEPENDENT entities.
-async function resolveOrCreate(
+// Promote an entity's type toward specificity — a known `org`/`project` is never demoted
+// back to the `"thing"` fallback once we've learned it. (Identity stays the label; the type
+// is just a soft descriptive tag that sharpens over time.)
+async function promoteType(db: PGlite, id: number, currentType: string, incomingType: string): Promise<void> {
+  if (incomingType !== "thing" && (currentType === "thing" || !currentType))
+    await db.query(`update entities set type = $1 where id = $2`, [incomingType, id]);
+}
+
+// Resolve a mention to a node. IDENTITY = the canonical label, decoupled from the LLM's
+// volatile `type` (so "Daimonion" is one node whether typed org or thing). Layers:
+//   1. exact (normalized) match  → reuse        [cheap, certain]
+//   2. remembered alias          → reuse        [a previously-confirmed variant]
+//   3. fuzzy lexical (typo)      → QA → reuse    [Daimonion ≈ Daiamnion]
+//   4. no match                  → create       [independent=global; dependent=owner-scoped + edge]
+// `type` only decides how a GENUINELY-NEW node is created; it never forks an existing identity.
+export async function resolveOrCreate(
   db: PGlite, label: string, type: string | undefined,
   ownerId: number | null, occurred_at: string, interactionId: number,
+  account: string | null = null,
 ): Promise<number> {
   const t = type || "thing";
-  const independent = INDEPENDENT.has(t);
+  const display = String(label).trim();
+  const norm = normLabel(display);
 
-  if (independent || ownerId == null) {
-    // global: people/orgs, or dependents with no known owner (e.g. account-less eval)
-    const sel = await db.query<{ id: number }>(`select id from entities where lower(label) = lower($1) limit 1`, [label]);
-    if (sel.rows.length) return sel.rows[0].id;
-    return (await db.query<{ id: number }>(`insert into entities (type, label) values ($1, $2) returning id`, [t, label])).rows[0].id;
+  const ents = (await db.query<{ id: number; label: string; type: string }>(
+    `select id, label, type from entities`)).rows;
+
+  // 1. exact normalized match — identity is the name, regardless of type.
+  const exact = ents.find((e) => normLabel(e.label) === norm);
+  if (exact) { await promoteType(db, exact.id, exact.type, t); return exact.id; }
+
+  // 2. remembered alias (a previously-confirmed variant/typo).
+  const al = await db.query<{ entity_id: number }>(
+    `select entity_id from entity_aliases where norm = $1 limit 1`, [norm]);
+  if (al.rows.length) return al.rows[0].entity_id;
+
+  // 3. fuzzy lexical candidate — nearest existing label within a length-scaled edit cap.
+  let best: { id: number; label: string; type: string; d: number } | null = null;
+  for (const e of ents) {
+    const en = normLabel(e.label);
+    const cap = fuzzyCap(norm, en);
+    if (cap < 1) continue;
+    const d = osaDistance(norm, en);
+    if (d >= 1 && d <= cap && (!best || d < best.d)) best = { ...e, d };
+  }
+  if (best) {
+    // QA gate — fuzzy proposes, the guardrail confirms (rejects look-alikes like Pythia/Python).
+    const same = await sameEntity(display, best.label, account);
+    logEvent("entity.fuzzy", { incoming: display, candidate: best.label, distance: best.d, same: same.ok, reason: same.reason });
+    if (same.ok) {
+      await db.query(
+        `insert into entity_aliases (entity_id, alias, norm) values ($1, $2, $3) on conflict (norm) do nothing`,
+        [best.id, display, norm]);
+      await promoteType(db, best.id, best.type, t);
+      return best.id;
+    }
   }
 
-  // dependent + known owner: match only within the owner's children
-  const sel = await db.query<{ id: number }>(
-    `select e.id from entities e
-       join facts f on f.object_entity_id = e.id
-      where lower(e.label) = lower($1) and f.subject_id = $2 and f.predicate = any($3)
-      limit 1`, [label, ownerId, OWNERSHIP_PREDS]);
-  if (sel.rows.length) return sel.rows[0].id;
-
-  // create + enforce the owner edge (no orphans)
-  const childId = (await db.query<{ id: number }>(`insert into entities (type, label) values ($1, $2) returning id`, [t, label])).rows[0].id;
-  await db.query(
-    `insert into facts (subject_id, predicate, object_entity_id, shape, valid_from, source_interaction_id, source_span)
-     values ($1, 'has', $2, 'multi', $3, $4, $5)`,
-    [ownerId, childId, occurred_at, interactionId, "(owner scope)"]);
+  // 4. no match → create. independent (person/org) is global; a dependent gets an owner edge.
+  const independent = INDEPENDENT.has(t);
+  const childId = (await db.query<{ id: number }>(
+    `insert into entities (type, label) values ($1, $2) returning id`, [t, display])).rows[0].id;
+  if (!independent && ownerId != null && ownerId !== childId) {
+    await db.query(
+      `insert into facts (subject_id, predicate, object_entity_id, shape, valid_from, source_interaction_id, source_span)
+       values ($1, 'has', $2, 'multi', $3, $4, $5)`,
+      [ownerId, childId, occurred_at, interactionId, "(owner scope)"]);
+  }
   return childId;
 }
 
@@ -100,16 +140,23 @@ export async function ingest(db: PGlite, it: Interaction, opts: IngestOpts = {})
     if (!ex?.subject || !ex?.predicate || ex?.object == null) continue; // skip malformed
     const shape = ex.shape === "multi" ? "multi" : "single";
 
-    // 4. resolve (kind-dependent): subject scoped to the account; object scoped to its owner
-    const subjectId = await resolveOrCreate(db, String(ex.subject), ex.subject_type, accountId, it.occurred_at, interactionId);
+    // 4. resolve (identity = label): subject scoped to the account; object scoped to its owner
+    const subjectId = await resolveOrCreate(db, String(ex.subject), ex.subject_type, accountId, it.occurred_at, interactionId, opts.account ?? null);
     let objectEntityId: number | null = null;
     let objectLiteral: string | null = null;
     if (ex.object_kind === "entity") {
       // an explicit ownership edge means the SUBJECT owns the object; otherwise default to the account
       const ownerForObject = OWNERSHIP_PREDS.includes(String(ex.predicate).toLowerCase()) ? subjectId : accountId;
-      objectEntityId = await resolveOrCreate(db, String(ex.object), ex.object_type, ownerForObject, it.occurred_at, interactionId);
+      objectEntityId = await resolveOrCreate(db, String(ex.object), ex.object_type, ownerForObject, it.occurred_at, interactionId, opts.account ?? null);
     } else {
       objectLiteral = String(ex.object);
+    }
+
+    // self-loop guard: "X has X" / "X status X" carries no information (e.g. when the account
+    // node and the extracted topic resolve to the same entity — the old "Daimonion has Daimonion").
+    if (objectEntityId != null && objectEntityId === subjectId) {
+      logEvent("skip.selfloop", { subject: ex.subject, predicate: ex.predicate, object: ex.object });
+      continue;
     }
 
     // 5. persist as PROVISIONAL (+ source_hash for drift detection). Not trusted until QA passes.

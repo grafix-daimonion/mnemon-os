@@ -38,6 +38,18 @@ create table if not exists entities (
   created_at  timestamptz not null default now()
 );
 
+-- 2b. entity_aliases — remembered spelling/wording variants that resolve to one entity.
+-- When fuzzy matching (typo) or semantic matching (reworded) is QA-confirmed as the same
+-- entity, the variant is recorded here so the next mention resolves by cheap lookup, never
+-- re-litigated. `norm` is the normalized key (lower/trim/collapsed) and is unique.
+create table if not exists entity_aliases (
+  id          bigserial   primary key,
+  entity_id   bigint      not null references entities(id),
+  alias       text        not null,                  -- the variant as seen (display)
+  norm        text        not null,                  -- normalized key for matching
+  created_at  timestamptz not null default now()
+);
+
 -- 3. facts — the bi-temporal heart. subject—predicate—object, validity-windowed.
 create table if not exists facts (
   id                    bigserial   primary key,
@@ -99,6 +111,10 @@ create index if not exists facts_validity on facts (valid_from, valid_until);
 create index if not exists chunks_fts on chunks using gin (to_tsvector('english', content));
 create index if not exists chunks_vec on chunks using hnsw (embedding vector_cosine_ops);
 create index if not exists chunks_interaction on chunks (interaction_id);
+
+-- Alias resolution: one normalized variant maps to exactly one entity.
+create unique index if not exists entity_aliases_norm   on entity_aliases (norm);
+create index        if not exists entity_aliases_entity on entity_aliases (entity_id);
 
 -- Forward-compat for existing file-backed stores (no-op on fresh DBs; ALTERs run after chunks exists).
 alter table facts add column if not exists source_chunk_id bigint references chunks(id);
