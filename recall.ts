@@ -88,13 +88,33 @@ EVEN IF worded differently (e.g. "team commitment to SSO deadline = will meet" a
   };
 }
 
-// STEP 4 — SQL, one job: the ABSENCE verdict. The LLM does not get a vote here.
-// Embedding-free keyword scan over the verbatim: if the source never mentions it, it is empty.
-async function sourceHasEvidence(db: PGlite, question: string): Promise<boolean> {
-  const hit = await db.query(
-    `select 1 from interactions where to_tsvector('english', content) @@ plainto_tsquery('english', $1) limit 1`,
-    [question]);
-  return hit.rows.length > 0;
+// STEP 4 — L0 FLOOR: keyword-search the verbatim chunks. This is both the absence arbiter AND a real
+// fallback answer when the fact layer missed — no clean subject required. (Vector search joins here
+// once the embedder lands.)
+async function searchChunks(db: PGlite, question: string, asOf: string | null): Promise<any[]> {
+  const where = asOf ? `and i.occurred_at <= $2` : ``;
+  const params = asOf ? [question, asOf] : [question];
+  const res = await db.query<any>(
+    `select c.content, i.occurred_at as src_occurred_at
+     from chunks c join interactions i on i.id = c.interaction_id
+     where to_tsvector('english', c.content) @@ plainto_tsquery('english', $1) ${where}
+     order by i.occurred_at desc, ts_rank(to_tsvector('english', c.content), plainto_tsquery('english', $1)) desc
+     limit 5`, params);
+  return res.rows;
+}
+
+// LLM, one job: answer from the retrieved verbatim excerpts (the user's own words), or say unknown.
+async function answerFromChunks(question: string, chunks: any[]): Promise<{ answer: string; index: number }> {
+  const list = chunks.map((c, i) => ({ index: i, excerpt: c.content }));
+  const j = await llmJSON(
+    `Answer the question using ONLY the listed source excerpts (the user's own words). Return JSON {answer, index}.
+- index: the array index of the excerpt you used, or -1 if none answers it.
+- answer: a short direct answer drawn from that excerpt; "unknown" if the excerpts don't answer it.`,
+    JSON.stringify({ question, excerpts: list }));
+  return {
+    answer: String(j?.answer ?? "").trim(),
+    index: Number.isInteger(j?.index) ? j.index : -1,
+  };
 }
 
 async function run(db: PGlite, question: string, asOf: string | null): Promise<RecallResult> {
@@ -117,12 +137,21 @@ async function run(db: PGlite, question: string, asOf: string | null): Promise<R
     return { type: "answer", answer: pick.answer, anchor: chosen.src_content, source_occurred_at: toISO(chosen.src_occurred_at) };
   }
 
-  // STEP 4 — absence is decided here, by the source, not by the LLM above.
-  const hasEvidence = await sourceHasEvidence(db, question);
-  logEvent("recall.absence", { source_has_evidence: hasEvidence, verdict: hasEvidence ? "unresolved" : "honest_empty" });
-  return hasEvidence
-    ? { type: "unresolved", reason: "the source mentions this, but no structured fact resolved it (worded differently?)" }
-    : { type: "honest_empty", reason: "no evidence in source" };
+  // STEP 4 — L0 FLOOR: the fact layer didn't resolve. Fall back to the verbatim chunks.
+  const chunks = await searchChunks(db, question, asOf);
+  logEvent("recall.floor", { chunk_hits: chunks.length });
+  if (chunks.length) {
+    const fa = await answerFromChunks(question, chunks);
+    logEvent("recall.floor_pick", { index: fa.index, answer: fa.answer });
+    if (fa.index >= 0 && fa.index < chunks.length && fa.answer && fa.answer.toLowerCase() !== "unknown") {
+      const c = chunks[fa.index];
+      return { type: "answer", answer: fa.answer, anchor: c.content, source_occurred_at: toISO(c.src_occurred_at) };
+    }
+    // the source mentions it, but no clear answer resolved — honest, never fabricated
+    return { type: "unresolved", reason: "the source mentions this, but no clear answer resolved" };
+  }
+  // nothing in the source at all
+  return { type: "honest_empty", reason: "no evidence in source" };
 }
 
 export const recall = (db: PGlite, q: string) => run(db, q, null);

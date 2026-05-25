@@ -72,6 +72,9 @@ export async function ingest(db: PGlite, it: Interaction, opts: IngestOpts = {})
     await db.query(`insert into chunks (interaction_id, ord, content) values ($1, $2, $3)`,
       [interactionId, i, pieces[i]]);
 
+  // verbatim + chunks are safe above. Extraction is best-effort: a flaky LLM call must NOT abort the
+  // batch (failure-recovery, Synapsis §5) — the verbatim/chunks stay; catch-up reprocesses later.
+  try {
   // owner scope for this conversation's dependent entities (explicit; Ownership v2 §7.1)
   const accountId = opts.account
     ? await resolveOrCreate(db, opts.account, "org", null, it.occurred_at, interactionId)
@@ -140,5 +143,8 @@ export async function ingest(db: PGlite, it: Interaction, opts: IngestOpts = {})
           console.log(`  ↳ superseded fact #${existing.id} ("${existing.object}") — ${v.reason}`);
       }
     }
+  }
+  } catch (e) {
+    logEvent("ingest.extract_failed", { interaction_id: interactionId, error: String(e) });
   }
 }
