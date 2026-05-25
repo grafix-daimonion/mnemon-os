@@ -56,6 +56,7 @@ create table if not exists facts (
   source_hash           text,                                  -- hash of the source span → drift detection (E2 QA)
   status                text        not null default 'confirmed', -- 'provisional'|'confirmed'|'quarantined' (E2 flips default → 'provisional')
   confidence            real        not null default 1.0,
+  embedding             vector(384),                           -- E3: fact embedding for cross-subject contradiction candidates
   created_at            timestamptz not null default now()
 );
 
@@ -103,3 +104,5 @@ create index if not exists chunks_interaction on chunks (interaction_id);
 alter table facts add column if not exists source_chunk_id bigint references chunks(id);
 alter table facts add column if not exists source_hash text;
 alter table facts add column if not exists status text not null default 'confirmed';
+alter table facts add column if not exists embedding vector(384);
+create index if not exists facts_vec on facts using hnsw (embedding vector_cosine_ops);
