@@ -24,6 +24,10 @@ export interface RecallResult {
 
 const toISO = (v: any): string => (v instanceof Date ? v.toISOString() : new Date(v).toISOString());
 
+// Predicates that mean "this is the subject's" — walked when gathering candidates, so a question
+// about an owner reaches facts on the things it owns (Acme -> contract -> renewal date).
+const TRAVERSAL_PREDS = ["has", "owns", "part of", "runs", "leads", "member of", "responsible for", "works on"];
+
 // STEP 1 — LLM, one job: name the subject.
 async function subjectOf(question: string): Promise<string | null> {
   const j = await llmJSON(
@@ -38,24 +42,38 @@ async function selectFacts(db: PGlite, subject: string, asOf: string | null): Pr
     `select id from entities where lower(label) = lower($1) limit 1`, [subject]);
   if (!ent.rows.length) return [];
   const subjectId = ent.rows[0].id;
-  const where = asOf
-    ? `f.subject_id = $1 and f.valid_from <= $2 and (f.valid_until is null or f.valid_until > $2)`
-    : `f.subject_id = $1 and f.valid_until is null`;
-  const params = asOf ? [subjectId, asOf] : [subjectId];
+  // scope = the subject + everything it owns (ownership-edge descendants, bounded depth) — so a
+  // question about Acme reaches the renewal date sitting on Acme's contract one hop down.
+  const asOfClause = asOf
+    ? `f.valid_from <= $3 and (f.valid_until is null or f.valid_until > $3)`
+    : `f.valid_until is null`;
+  const params = asOf ? [subjectId, TRAVERSAL_PREDS, asOf] : [subjectId, TRAVERSAL_PREDS];
   const res = await db.query<any>(
-    `select f.predicate, f.object_literal, oe.label as object_entity_label,
+    `with recursive scope(id, depth) as (
+        select $1::bigint, 0
+        union all
+        select f.object_entity_id, s.depth + 1
+        from scope s
+        join facts f on f.subject_id = s.id
+        where f.object_entity_id is not null and lower(f.predicate) = any($2) and s.depth < 3
+     )
+     select f.predicate, f.object_literal, oe.label as object_entity_label, sj.label as subject_label,
             i.content as src_content, i.occurred_at as src_occurred_at
-     from facts f join interactions i on i.id = f.source_interaction_id
+     from facts f
+     join entities sj on sj.id = f.subject_id
+     join interactions i on i.id = f.source_interaction_id
      left join entities oe on oe.id = f.object_entity_id
-     where ${where} order by f.valid_from desc`, params);
+     where f.subject_id in (select id from scope) and ${asOfClause}
+     order by f.valid_from desc`, params);
   return res.rows.map((r) => ({ ...r, object_display: r.object_literal ?? r.object_entity_label }));
 }
 
 // STEP 3 — LLM, one job: pick the relevant fact and read its stance.
 async function answerFrom(question: string, facts: any[]): Promise<{ answer: string; index: number }> {
-  const list = facts.map((f, i) => ({ index: i, topic: f.predicate, value: f.object_display }));
+  const list = facts.map((f, i) => ({ index: i, about: f.subject_label, topic: f.predicate, value: f.object_display }));
   const j = await llmJSON(
-    `Answer the question using the listed facts about the subject. Return JSON {answer, index}.
+    `Answer the question using the listed facts (each is "about" a subject or something it owns).
+Return JSON {answer, index}.
 Pick the SINGLE most relevant fact. A fact is relevant if it concerns the same topic as the question,
 EVEN IF worded differently (e.g. "team commitment to SSO deadline = will meet" answers
 "Did Alice agree to the SSO deadline?"). Use index -1 ONLY if no listed fact is even topically related.
