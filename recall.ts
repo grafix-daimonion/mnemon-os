@@ -161,8 +161,8 @@ async function run(db: PGlite, question: string, asOf: string | null): Promise<R
   const subject = await subjectOf(question);
   logEvent("recall.subject", { question, asOf, subject });
 
-  // STEP 2
-  const facts = subject ? await selectFacts(db, subject, asOf) : [];
+  // STEP 2 (MNEMON_NO_FACTS forces the L0 floor — proves graceful degradation)
+  const facts = (subject && !process.env.MNEMON_NO_FACTS) ? await selectFacts(db, subject, asOf) : [];
   logEvent("recall.candidates", { subject, count: facts.length });
 
   // STEP 3
