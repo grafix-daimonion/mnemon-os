@@ -11,6 +11,7 @@ import { extractFacts } from "./extract.ts";
 import { contradicts, type Fact } from "./synapsis/resolve.ts";
 import { logEvent } from "./logger.ts";
 import { chunkText } from "./chunk.ts";
+import { embed, toVector } from "./embed.ts";
 
 export interface Interaction {
   content: string;
@@ -66,11 +67,13 @@ export async function ingest(db: PGlite, it: Interaction, opts: IngestOpts = {})
     [it.content, it.speaker, it.occurred_at]);
   const interactionId = ins.rows[0].id;
 
-  // 1b. L0 floor: chunk + store the verbatim (keyword-indexed now; embeddings filled by the embedder).
+  // 1b. L0 floor: chunk + embed + store the verbatim (keyword + vector indexed).
   const pieces = chunkText(it.content);
-  for (let i = 0; i < pieces.length; i++)
-    await db.query(`insert into chunks (interaction_id, ord, content) values ($1, $2, $3)`,
-      [interactionId, i, pieces[i]]);
+  for (let i = 0; i < pieces.length; i++) {
+    const vec = toVector(await embed(pieces[i]));
+    await db.query(`insert into chunks (interaction_id, ord, content, embedding) values ($1, $2, $3, $4::vector)`,
+      [interactionId, i, pieces[i], vec]);
+  }
 
   // verbatim + chunks are safe above. Extraction is best-effort: a flaky LLM call must NOT abort the
   // batch (failure-recovery, Synapsis §5) — the verbatim/chunks stay; catch-up reprocesses later.

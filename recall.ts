@@ -13,6 +13,11 @@
 import type { PGlite } from "@electric-sql/pglite";
 import { llmJSON } from "./llm.ts";
 import { logEvent } from "./logger.ts";
+import { embed, toVector } from "./embed.ts";
+
+// Vector relevance gate: only chunks within this cosine distance count as a semantic hit. Looser →
+// catches more paraphrase but risks false-positive honest-empty; tighter → safer. [OPEN] tune on eval.
+const VEC_MAX_DIST = 0.45;
 
 export interface RecallResult {
   type: "answer" | "honest_empty" | "unresolved";
@@ -92,15 +97,46 @@ EVEN IF worded differently (e.g. "team commitment to SSO deadline = will meet" a
 // fallback answer when the fact layer missed — no clean subject required. (Vector search joins here
 // once the embedder lands.)
 async function searchChunks(db: PGlite, question: string, asOf: string | null): Promise<any[]> {
-  const where = asOf ? `and i.occurred_at <= $2` : ``;
-  const params = asOf ? [question, asOf] : [question];
-  const res = await db.query<any>(
+  // SEMANTIC half (vector) — catches paraphrase; relevance-gated so it doesn't return nearest-always.
+  const qvec = toVector(await embed(question));
+  const vWhere = asOf ? `and i.occurred_at <= $2` : ``;
+  const vParams = asOf ? [qvec, asOf] : [qvec];
+  const vres = await db.query<any>(
     `select c.content, i.occurred_at as src_occurred_at
      from chunks c join interactions i on i.id = c.interaction_id
-     where to_tsvector('english', c.content) @@ plainto_tsquery('english', $1) ${where}
-     order by i.occurred_at desc, ts_rank(to_tsvector('english', c.content), plainto_tsquery('english', $1)) desc
-     limit 5`, params);
-  return res.rows;
+     where c.embedding is not null and (c.embedding <=> $1::vector) < ${VEC_MAX_DIST} ${vWhere}
+     order by c.embedding <=> $1::vector limit 5`, vParams);
+
+  // LEXICAL half (keyword) — catches exact terms/names the vector might miss.
+  const kWhere = asOf ? `and i.occurred_at <= $2` : ``;
+  const kParams = asOf ? [question, asOf] : [question];
+  const kres = await db.query<any>(
+    `select c.content, i.occurred_at as src_occurred_at
+     from chunks c join interactions i on i.id = c.interaction_id
+     where to_tsvector('english', c.content) @@ plainto_tsquery('english', $1) ${kWhere}
+     order by i.occurred_at desc limit 5`, kParams);
+
+  // merge, dedup by content, recency-biased (latest = most likely current)
+  const seen = new Set<string>();
+  const merged: any[] = [];
+  for (const r of [...vres.rows, ...kres.rows]) {
+    if (seen.has(r.content)) continue;
+    seen.add(r.content);
+    merged.push(r);
+  }
+  merged.sort((a, b) => new Date(b.src_occurred_at).getTime() - new Date(a.src_occurred_at).getTime());
+  return merged.slice(0, 6);
+}
+
+// The CERTAIN absence arbiter (honest-empty spec): keyword scan over the verbatim. Vector noise gets
+// no vote on "there is nothing" — only the lexical scan can declare lexical absence.
+async function keywordHasEvidence(db: PGlite, question: string, asOf: string | null): Promise<boolean> {
+  const where = asOf ? `and i.occurred_at <= $2` : ``;
+  const params = asOf ? [question, asOf] : [question];
+  const hit = await db.query(
+    `select 1 from chunks c join interactions i on i.id = c.interaction_id
+     where to_tsvector('english', c.content) @@ plainto_tsquery('english', $1) ${where} limit 1`, params);
+  return hit.rows.length > 0;
 }
 
 // LLM, one job: answer from the retrieved verbatim excerpts (the user's own words), or say unknown.
@@ -147,11 +183,13 @@ async function run(db: PGlite, question: string, asOf: string | null): Promise<R
       const c = chunks[fa.index];
       return { type: "answer", answer: fa.answer, anchor: c.content, source_occurred_at: toISO(c.src_occurred_at) };
     }
-    // the source mentions it, but no clear answer resolved — honest, never fabricated
-    return { type: "unresolved", reason: "the source mentions this, but no clear answer resolved" };
   }
-  // nothing in the source at all
-  return { type: "honest_empty", reason: "no evidence in source" };
+  // ABSENCE verdict — decided by the CERTAIN keyword scan, never by vector noise (honest-empty spec).
+  const kw = await keywordHasEvidence(db, question, asOf);
+  logEvent("recall.absence", { keyword_evidence: kw });
+  return kw
+    ? { type: "unresolved", reason: "the source mentions this, but no clear answer resolved" }
+    : { type: "honest_empty", reason: "no evidence in source" };
 }
 
 export const recall = (db: PGlite, q: string) => run(db, q, null);
