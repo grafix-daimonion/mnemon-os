@@ -13,7 +13,7 @@ import { logEvent } from "./logger.ts";
 import { chunkText } from "./chunk.ts";
 import { embed, toVector } from "./embed.ts";
 import { faithful, sourceHash, sameEntity } from "./synapsis/verify.ts";
-import { osaDistance, normLabel, fuzzyCap } from "./synapsis/fuzzy.ts";
+import { osaDistance, normLabel, fuzzyCap, parseVersion, versionVerdict } from "./synapsis/fuzzy.ts";
 import { buildDiary } from "./diary.ts";
 
 export interface Interaction {
@@ -67,9 +67,39 @@ export async function resolveOrCreate(
     `select entity_id from entity_aliases where norm = $1 limit 1`, [norm]);
   if (al.rows.length) return al.rows[0].entity_id;
 
+  // 2.5. version-aware policy (deterministic for clear cases; ambiguous falls through to fuzzy+QA):
+  //   - person/org + version suffix          → merge   (versions don't apply → artifact)
+  //   - same base, bare ↔ versioned          → merge   (umbrella absorbs instance)
+  //   - same base, two distinct version Ns   → distinct (separate releases)
+  //   precedence: distinct > merge — once versioned siblings exist, preserve specificity.
+  const vVerdicts = ents.map((e) => ({ e, v: versionVerdict(display, e.label, t, e.type) }));
+  const vDistinct = vVerdicts.filter((x) => x.v === "distinct");
+  const vMerge = vVerdicts.filter((x) => x.v === "merge");
+  if (vDistinct.length === 0 && vMerge.length > 0) {
+    const m = vMerge[0]; // first merge target (typically the bare umbrella)
+    logEvent("entity.version-rule", { incoming: display, type: t, verdict: "merge", target: m.e.label, target_type: m.e.type });
+    await db.query(
+      `insert into entity_aliases (entity_id, alias, norm) values ($1, $2, $3) on conflict (norm) do nothing`,
+      [m.e.id, display, norm]);
+    await promoteType(db, m.e.id, m.e.type, t);
+    return m.e.id;
+  }
+  const skipFuzzyBase = vDistinct.length > 0;
+  if (skipFuzzyBase) {
+    logEvent("entity.version-rule", { incoming: display, type: t, verdict: "create-distinct", siblings: vDistinct.map((x) => x.e.label) });
+  }
+
   // 3. fuzzy lexical candidate — nearest existing label within a length-scaled edit cap.
+  const iv = parseVersion(display);
+  const iBase = (iv?.base ?? display).toLowerCase().trim();
   let best: { id: number; label: string; type: string; d: number } | null = null;
   for (const e of ents) {
+    if (skipFuzzyBase) {
+      // distinct version siblings exist → don't let fuzzy re-merge against same-base candidates
+      const ev = parseVersion(e.label);
+      const eBase = (ev?.base ?? e.label).toLowerCase().trim();
+      if (eBase === iBase) continue;
+    }
     const en = normLabel(e.label);
     const cap = fuzzyCap(norm, en);
     if (cap < 1) continue;

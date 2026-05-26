@@ -46,3 +46,42 @@ export function normLabel(s: string): string {
 export function fuzzyCap(a: string, b: string): number {
   return Math.floor(Math.max(a.length, b.length) / 4);
 }
+
+// ─── Version-aware identity (the policy that lands deterministically; ambiguous
+//     cases fall through to fuzzy+QA, where the LLM reasons WITH this same rule
+//     in its prompt — the "code owns the track, LLM has freedom within" principle).
+
+// Detect a trailing version suffix — separator-required so plain words starting with "v"
+// (e.g. "Vortex") don't false-match. Returns {base, version} or null.
+const VERSION_RX = /[\s_\-]+v(\d+(?:\.\d+)*)\s*$/i;
+
+export function parseVersion(label: string): { base: string; version: string } | null {
+  const s = (label ?? "").trim();
+  const m = s.match(VERSION_RX);
+  if (!m) return null;
+  return { base: s.slice(0, m.index!).trim(), version: m[1] };
+}
+
+const PERSON_LIKE = new Set(["person", "org"]);
+
+// The deterministic core of the versions policy. Returns a clear verdict when the
+// case fits the rule; otherwise "undecided" → caller falls through to fuzzy+QA.
+//   merge      = same thing (umbrella absorbs instance, or person/org artifact)
+//   distinct   = different things (two distinct version numbers of the same project)
+//   undecided  = not a clear version case → let other layers / the LLM decide
+export function versionVerdict(
+  incomingLabel: string, candidateLabel: string,
+  incomingType: string, candidateType: string,
+): "merge" | "distinct" | "undecided" {
+  const iv = parseVersion(incomingLabel);
+  const cv = parseVersion(candidateLabel);
+  if (!iv && !cv) return "undecided";        // neither versioned — not this layer's job
+  const iBase = (iv?.base ?? incomingLabel).toLowerCase().trim();
+  const cBase = (cv?.base ?? candidateLabel).toLowerCase().trim();
+  if (iBase !== cBase) return "undecided";   // different bases — version difference irrelevant
+  if (PERSON_LIKE.has(incomingType) || PERSON_LIKE.has(candidateType))
+    return "merge";                           // people/orgs can't have versions → artifact
+  if (iv && cv && iv.version !== cv.version)
+    return "distinct";                        // two distinct versions of the same project
+  return "merge";                             // bare ↔ versioned: umbrella absorbs instance
+}

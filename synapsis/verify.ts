@@ -19,7 +19,14 @@ export async function sameEntity(
 typo, abbreviation, or reworded variant of the other — OR they may be genuinely different things
 that merely look/sound alike. Return JSON {same: boolean, reason: string}.
 Be CONSERVATIVE: only say same=true if you are confident they denote the same specific entity.
-When unsure, say false — a wrong merge corrupts memory; a missed merge only duplicates it.`,
+When unsure, say false — a wrong merge corrupts memory; a missed merge only duplicates it.
+
+If one or both names carry a version suffix, apply this policy where it fits:
+- people and organizations have NO versions: "Acme v2" is an artifact of "Acme" → same=true.
+- projects/products/campaigns/specs DO have versions:
+  - bare name and one of its versions ("Pythia" ↔ "Pythia v4") refer to the same overall thing → same=true.
+  - two distinct version numbers of the same name ("Pythia v3" vs "Pythia v4") are different releases → same=false.
+If the policy doesn't fit (no version suffix, or the case is ambiguous), judge by general identity.`,
     JSON.stringify({ name_a: incoming, name_b: candidate, account }));
   return { ok: !!j?.same, reason: String(j?.reason ?? "") };
 }
