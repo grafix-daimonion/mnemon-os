@@ -51,12 +51,23 @@ export function correctShape(predicate: string, llmShape: string): "single" | "m
   return llmShape === "multi" ? "multi" : "single";
 }
 
-// Promote an entity's type toward specificity — a known `org`/`project` is never demoted
-// back to the `"thing"` fallback once we've learned it. (Identity stays the label; the type
-// is just a soft descriptive tag that sharpens over time.)
+// Promote an entity's type toward specificity. F-MNEMON-23 rule (ENGINE_SPEC_v5 §11):
+//   - Promote only if incoming is more specific (not 'thing'/empty).
+//   - 'thing'/empty → specific: simple promotion, no log.
+//   - specific A → specific B (conflict): last-writer-wins, logged as
+//     `entity.type_promotion_conflict` for audit. Caller (operator) can review.
+//   - Never demote to 'thing' (existing rule, kept).
 async function promoteType(db: PGlite, id: number, currentType: string, incomingType: string): Promise<void> {
-  if (incomingType !== "thing" && (currentType === "thing" || !currentType))
-    await db.query(`update entities set type = $1 where id = $2`, [incomingType, id]);
+  const inc = (incomingType || "thing").trim();
+  const cur = (currentType || "thing").trim();
+  if (inc === "thing" || inc === cur) return;
+  if (cur === "thing" || !cur) {
+    await db.query(`update entities set type = $1 where id = $2`, [inc, id]);
+    return;
+  }
+  // Two distinct non-'thing' types — conflict; last-writer-wins; audit-log.
+  logEvent("entity.type_promotion_conflict", { entity_id: id, prior_type: cur, new_type: inc, action: "last_writer_wins" });
+  await db.query(`update entities set type = $1 where id = $2`, [inc, id]);
 }
 
 // Resolve a mention to a node. IDENTITY = the canonical label, decoupled from the LLM's
@@ -152,115 +163,161 @@ export async function resolveOrCreate(
   return childId;
 }
 
+// Concurrency cap for parallel per-chunk extraction (ENGINE_SPEC_v5 §2).
+// At ~3 LLM calls per chunk × 8 chunks = up to 24 concurrent Anthropic requests per batch —
+// well inside Haiku's per-minute budget for typical save sizes; Sonnet too. Sequential
+// opt-out via MNEMON_EXTRACT_SEQUENTIAL=1 for installs hitting rate limits.
+const EXTRACT_MAX_CONCURRENCY = 8;
+
 export async function ingest(db: PGlite, it: Interaction, opts: IngestOpts = {}): Promise<void> {
-  // 1. archive verbatim (append-only) — first, before anything that can fail
+  // 1. archive verbatim (append-only) — first, before anything that can fail.
   const ins = await db.query<{ id: number }>(
     `insert into interactions (content, speaker, occurred_at) values ($1, $2, $3) returning id`,
     [it.content, it.speaker, it.occurred_at]);
   const interactionId = ins.rows[0].id;
 
   // 1b. L0 floor: chunk + embed + store the verbatim (keyword + vector indexed).
+  // Collect (id, content) so per-chunk extraction can attach source_chunk_id by construction.
   const pieces = chunkText(it.content);
+  const chunkRecords: { id: number; content: string }[] = [];
   for (let i = 0; i < pieces.length; i++) {
     const vec = toVector(await embed(pieces[i]));
-    await db.query(`insert into chunks (interaction_id, ord, content, embedding) values ($1, $2, $3, $4::vector)`,
+    const r = await db.query<{ id: number }>(
+      `insert into chunks (interaction_id, ord, content, embedding) values ($1, $2, $3, $4::vector) returning id`,
       [interactionId, i, pieces[i], vec]);
+    chunkRecords.push({ id: r.rows[0].id, content: pieces[i] });
   }
 
-  // verbatim + chunks are safe above. Extraction is best-effort: a flaky LLM call must NOT abort the
-  // batch (failure-recovery, Synapsis §5) — the verbatim/chunks stay; catch-up reprocesses later.
+  // Verbatim + chunks are CONFIRMED at L0 above. Per-chunk extraction is best-effort; a flaky
+  // LLM call on one chunk must NOT lose facts from other chunks (per-chunk failure isolation).
   try {
-  // owner scope for this conversation's dependent entities (explicit; Ownership v2 §7.1)
-  const accountId = opts.account
-    ? await resolveOrCreate(db, opts.account, "org", null, it.occurred_at, interactionId)
-    : null;
+    // Owner scope for this conversation's dependent entities (explicit; Ownership v2 §7.1).
+    const accountId = opts.account
+      ? await resolveOrCreate(db, opts.account, "org", null, it.occurred_at, interactionId)
+      : null;
 
-  // 2. gather context so extraction reuses, not re-mints (replace with owner-scoped retrieval — Task #2)
-  const ctxEntities = (await db.query<{ label: string; type: string }>(
-    `select label, type from entities order by id desc limit 100`)).rows;
-  const ctxPredicates = (await db.query<{ predicate: string }>(
-    `select distinct predicate from facts limit 100`)).rows.map((r) => r.predicate);
+    // 2. Gather context once so all per-chunk extractions reuse, not re-mint.
+    const ctxEntities = (await db.query<{ label: string; type: string }>(
+      `select label, type from entities order by id desc limit 100`)).rows;
+    const ctxPredicates = (await db.query<{ predicate: string }>(
+      `select distinct predicate from facts limit 100`)).rows.map((r) => r.predicate);
+    const ctx = { entities: ctxEntities, predicates: ctxPredicates, account: opts.account ?? null };
 
-  // 3. extract every durable fact, with context
-  const facts = await extractFacts(it.content, it.speaker, interactionId, {
-    entities: ctxEntities, predicates: ctxPredicates, account: opts.account ?? null,
-  });
-
-  for (const ex of facts) {
-    if (!ex?.subject || !ex?.predicate || ex?.object == null) continue; // skip malformed
-    // Force shape=multi for known accumulator predicates (commitments, tasks, ownerships, …)
-    // — protects against the F-MNEMON-17 loss where a later commitment supersedes an earlier one.
-    const shape = correctShape(String(ex.predicate), String(ex.shape ?? "single"));
-
-    // 4. resolve (identity = label): subject scoped to the account; object scoped to its owner
-    const subjectId = await resolveOrCreate(db, String(ex.subject), ex.subject_type, accountId, it.occurred_at, interactionId, opts.account ?? null);
-    let objectEntityId: number | null = null;
-    let objectLiteral: string | null = null;
-    if (ex.object_kind === "entity") {
-      // an explicit ownership edge means the SUBJECT owns the object; otherwise default to the account
-      const ownerForObject = OWNERSHIP_PREDS.includes(String(ex.predicate).toLowerCase()) ? subjectId : accountId;
-      objectEntityId = await resolveOrCreate(db, String(ex.object), ex.object_type, ownerForObject, it.occurred_at, interactionId, opts.account ?? null);
-    } else {
-      objectLiteral = String(ex.object);
-    }
-
-    // self-loop guard: "X has X" / "X status X" carries no information (e.g. when the account
-    // node and the extracted topic resolve to the same entity — the old "Daimonion has Daimonion").
-    if (objectEntityId != null && objectEntityId === subjectId) {
-      logEvent("skip.selfloop", { subject: ex.subject, predicate: ex.predicate, object: ex.object });
-      continue;
-    }
-
-    // 5. persist as PROVISIONAL (+ source_hash for drift detection). Not trusted until QA passes.
-    const factIns = await db.query<{ id: number }>(
-      `insert into facts (subject_id, predicate, object_entity_id, object_literal, shape, valid_from, source_interaction_id, source_span, source_hash, status)
-       values ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'provisional') returning id`,
-      [subjectId, ex.predicate, objectEntityId, objectLiteral, shape, it.occurred_at, interactionId, ex.source_span ?? null, sourceHash(ex.source_span ?? String(ex.object))]);
-    const incoming: Fact = {
-      id: factIns.rows[0].id, subjectId, subjectLabel: String(ex.subject),
-      predicate: ex.predicate, object: String(ex.object), shape, validFrom: it.occurred_at,
+    // 3. PER-CHUNK EXTRACTION (ENGINE_SPEC_v5 §2). Each chunk gets its own extract call;
+    //    facts carry source_chunk_id by construction; failure is isolated per-chunk;
+    //    smaller per-call LLM input closes the F-MNEMON-21 malformed-JSON failure mode.
+    //    Parallel by default (Promise.all in batches of EXTRACT_MAX_CONCURRENCY); sequential
+    //    via MNEMON_EXTRACT_SEQUENTIAL=1 for rate-limit-sensitive installs.
+    const sequential = process.env.MNEMON_EXTRACT_SEQUENTIAL === "1";
+    const perChunk: { chunk: { id: number; content: string }; facts: any[] }[] = [];
+    const extractOne = async (chunk: { id: number; content: string }) => {
+      try {
+        const facts = await extractFacts(chunk.content, it.speaker, interactionId, ctx);
+        return { chunk, facts };
+      } catch (e) {
+        // Per-chunk isolation: log, return empty, other chunks proceed.
+        logEvent("ingest.chunk_extract_failed", { interaction_id: interactionId, chunk_id: chunk.id, error: String(e) });
+        return { chunk, facts: [] };
+      }
     };
-
-    // 5b. QA — faithfulness cross-check vs the verbatim. Verify, don't trust.
-    const v = await faithful({ subject: String(ex.subject), predicate: ex.predicate, object: String(ex.object) }, it.content);
-    logEvent("qa", { fact_id: incoming.id, subject: ex.subject, predicate: ex.predicate, object: ex.object, supported: v.ok, reason: v.reason });
-    if (!v.ok) {
-      await db.query(`update facts set status = 'quarantined' where id = $1`, [incoming.id]);
-      if (!process.env.MNEMON_QUIET) console.log(`  ⚠ quarantined #${incoming.id} ("${ex.object}") — ${v.reason}`);
-      continue; // quarantined facts never drive current-state
-    }
-    await db.query(`update facts set status = 'confirmed' where id = $1`, [incoming.id]);
-
-    // 6. contradiction -> current-state: close any open CONFIRMED fact this one supersedes
-    const open = await db.query<any>(
-      `select f.id, f.predicate, f.object_literal, oe.label as object_entity_label, f.shape, f.valid_from
-       from facts f left join entities oe on oe.id = f.object_entity_id
-       where f.subject_id = $1 and f.valid_until is null and f.status = 'confirmed' and f.id <> $2`,
-      [subjectId, incoming.id]);
-    for (const row of open.rows) {
-      const existing: Fact = {
-        id: row.id, subjectId, subjectLabel: String(ex.subject),
-        predicate: row.predicate, object: row.object_literal ?? row.object_entity_label ?? "",
-        shape: row.shape, validFrom: toISO(row.valid_from),
-      };
-      const v = await contradicts(incoming, existing);
-      logEvent("contradiction", {
-        subject: ex.subject,
-        incoming: { predicate: incoming.predicate, object: incoming.object },
-        existing: { predicate: existing.predicate, object: existing.object },
-        verdict: v.contradicts, reason: v.reason,
-      });
-      if (v.contradicts) {
-        await db.query(`update facts set valid_until = $1, superseded_by = $2 where id = $3`,
-          [incoming.validFrom, incoming.id, existing.id]);
-        if (!process.env.MNEMON_QUIET)
-          console.log(`  ↳ superseded fact #${existing.id} ("${existing.object}") — ${v.reason}`);
+    if (sequential) {
+      for (const chunk of chunkRecords) perChunk.push(await extractOne(chunk));
+    } else {
+      for (let i = 0; i < chunkRecords.length; i += EXTRACT_MAX_CONCURRENCY) {
+        const batch = chunkRecords.slice(i, i + EXTRACT_MAX_CONCURRENCY);
+        perChunk.push(...await Promise.all(batch.map(extractOne)));
       }
     }
-  }
-  // L5: rebuild the day's Diary from CONFIRMED facts (deterministic, lossless, heavy-refs).
-  await buildDiary(db, it.occurred_at);
+
+    // 4. Process each fact from each chunk — resolve, persist, QA-vs-chunk, supersession.
+    for (const { chunk, facts } of perChunk) {
+      for (const ex of facts) {
+        if (!ex?.subject || !ex?.predicate || ex?.object == null) continue; // malformed
+        const shape = correctShape(String(ex.predicate), String(ex.shape ?? "single"));
+
+        // 4a. Resolve (identity = label): subject under account; object under its owner.
+        const subjectId = await resolveOrCreate(db, String(ex.subject), ex.subject_type, accountId, it.occurred_at, interactionId, opts.account ?? null);
+        let objectEntityId: number | null = null;
+        let objectLiteral: string | null = null;
+        if (ex.object_kind === "entity") {
+          const ownerForObject = OWNERSHIP_PREDS.includes(String(ex.predicate).toLowerCase()) ? subjectId : accountId;
+          objectEntityId = await resolveOrCreate(db, String(ex.object), ex.object_type, ownerForObject, it.occurred_at, interactionId, opts.account ?? null);
+        } else {
+          objectLiteral = String(ex.object);
+        }
+
+        // self-loop guard
+        if (objectEntityId != null && objectEntityId === subjectId) {
+          logEvent("skip.selfloop", { subject: ex.subject, predicate: ex.predicate, object: ex.object });
+          continue;
+        }
+
+        // Cross-chunk-suspected heuristic (ENGINE_SPEC_v5 §18): if a fact's source_span exists
+        // verbatim in OTHER chunks of the same interaction but NOT in its producing chunk,
+        // it's a candidate cross-chunk reconstruction. Logged only; not blocking.
+        if (ex.source_span && typeof ex.source_span === "string" && ex.source_span.length > 8) {
+          const inChunk = chunk.content.includes(ex.source_span);
+          if (!inChunk) {
+            logEvent("extract.cross_chunk_suspected", { interaction_id: interactionId, source_chunk_id: chunk.id, source_span: ex.source_span.slice(0, 120) });
+          }
+        }
+
+        // 4b. Persist as PROVISIONAL with source_chunk_id BY CONSTRUCTION (v5 §3 primary provenance).
+        const factIns = await db.query<{ id: number }>(
+          `insert into facts (subject_id, predicate, object_entity_id, object_literal, shape, valid_from,
+                              source_interaction_id, source_chunk_id, source_span, source_hash, status)
+           values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'provisional') returning id`,
+          [subjectId, ex.predicate, objectEntityId, objectLiteral, shape, it.occurred_at,
+           interactionId, chunk.id, ex.source_span ?? null, sourceHash(ex.source_span ?? String(ex.object))]);
+        const incoming: Fact = {
+          id: factIns.rows[0].id, subjectId, subjectLabel: String(ex.subject),
+          predicate: ex.predicate, object: String(ex.object), shape, validFrom: it.occurred_at,
+        };
+
+        // 4c. QA — faithfulness against THE PRODUCING CHUNK (v5 §4), not the whole turn.
+        const v = await faithful({ subject: String(ex.subject), predicate: ex.predicate, object: String(ex.object) }, chunk.content);
+        logEvent("qa", { fact_id: incoming.id, source_chunk_id: chunk.id, subject: ex.subject, predicate: ex.predicate, object: ex.object, supported: v.ok, reason: v.reason });
+        if (!v.ok) {
+          await db.query(`update facts set status = 'quarantined' where id = $1`, [incoming.id]);
+          if (!process.env.MNEMON_QUIET) console.log(`  ⚠ quarantined #${incoming.id} ("${ex.object}") — ${v.reason}`);
+          continue;
+        }
+        await db.query(`update facts set status = 'confirmed' where id = $1`, [incoming.id]);
+
+        // 4d. Contradiction → current-state: close any open CONFIRMED fact this one supersedes.
+        const open = await db.query<any>(
+          `select f.id, f.predicate, f.object_literal, oe.label as object_entity_label, f.shape, f.valid_from
+           from facts f left join entities oe on oe.id = f.object_entity_id
+           where f.subject_id = $1 and f.valid_until is null and f.status = 'confirmed' and f.id <> $2`,
+          [subjectId, incoming.id]);
+        for (const row of open.rows) {
+          const existing: Fact = {
+            id: row.id, subjectId, subjectLabel: String(ex.subject),
+            predicate: row.predicate, object: row.object_literal ?? row.object_entity_label ?? "",
+            shape: row.shape, validFrom: toISO(row.valid_from),
+          };
+          const cv = await contradicts(incoming, existing);
+          logEvent("contradiction", {
+            subject: ex.subject,
+            incoming: { predicate: incoming.predicate, object: incoming.object },
+            existing: { predicate: existing.predicate, object: existing.object },
+            verdict: cv.contradicts, reason: cv.reason,
+          });
+          if (cv.contradicts) {
+            await db.query(`update facts set valid_until = $1, superseded_by = $2 where id = $3`,
+              [incoming.validFrom, incoming.id, existing.id]);
+            if (!process.env.MNEMON_QUIET)
+              console.log(`  ↳ superseded fact #${existing.id} ("${existing.object}") — ${cv.reason}`);
+          }
+        }
+      }
+    }
+
+    // 5. L5 Diary rebuild from CONFIRMED facts (deterministic, lossless, heavy-refs).
+    await buildDiary(db, it.occurred_at);
   } catch (e) {
+    // Outer catch — only fires for non-extract failures (e.g. resolve/persist DB errors).
+    // Per-chunk extract failures are caught above and don't reach here.
     logEvent("ingest.extract_failed", { interaction_id: interactionId, error: String(e) });
   }
 }

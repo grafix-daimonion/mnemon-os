@@ -17,7 +17,11 @@ function loadKey(): string {
 }
 
 const client = new Anthropic({ apiKey: loadKey() });
-const MODEL = "claude-haiku-4-5-20251001"; // small + fast; swappable to local
+// MNEMON_LLM_MODEL — per-install opt-in to a different Anthropic model (e.g. claude-sonnet-4-6).
+// Default: Haiku 4.5 (small + fast + cheap). For installs where extraction recall on
+// dense / multi-claim content matters (Betty), set MNEMON_LLM_MODEL=claude-sonnet-4-6.
+// See ENGINE_SPEC_v5 §16.
+const MODEL = process.env.MNEMON_LLM_MODEL?.trim() || "claude-haiku-4-5-20251001";
 
 export async function llmJSON(system: string, user: string): Promise<any> {
   const resp = await client.messages.create({

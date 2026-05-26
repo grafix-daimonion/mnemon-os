@@ -12,7 +12,7 @@ import { z } from "zod";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { initDb } from "./db.ts";
-import { archive, assertFact, markSuperseded } from "./pipeline-class2.ts";
+import { archive, assertFact, markSuperseded, unmarkSuperseded } from "./pipeline-class2.ts";
 import { recallCandidates, keywordEvidence, history, readDiaryClass2 } from "./recall-class2.ts";
 import { findEntity, resolveOrCreateEntity } from "./entity-class2.ts";
 
@@ -47,6 +47,11 @@ server.registerTool("mark_superseded", {
   description: "Apply the bi-temporal close — host has judged new_fact_id is a real reversal of old_fact_id (same topic, real change). Sets old_fact.valid_until = occurred_at, old_fact.superseded_by = new_fact_id, and rebuilds the day's Diary.",
   inputSchema: { old_fact_id: z.number(), new_fact_id: z.number(), occurred_at: z.string() },
 }, async ({ old_fact_id, new_fact_id, occurred_at }) => text(await markSuperseded(db, old_fact_id, new_fact_id, occurred_at)));
+
+server.registerTool("unmark_superseded", {
+  description: "UNDO a supersession — reopen a fact that was closed by a prior mark_superseded call (sets valid_until=null, superseded_by=null). Use when the host's earlier supersession judgment was wrong; the original fact returns to current-state. Idempotent: returns {ok:false} if the fact wasn't actually superseded. Logged as `class2.unmark_superseded` for audit. (F-MNEMON-22.)",
+  inputSchema: { fact_id: z.number() },
+}, async ({ fact_id }) => text(await unmarkSuperseded(db, fact_id)));
 
 server.registerTool("recall_candidates", {
   description: "Deterministic candidates for a question: bi-temporal facts in the subject's scope (recursive ownership traversal, status='confirmed', time-filtered) + hybrid keyword+vector chunk matches. The HOST picks the best one and reads its stance — server does no LLM reasoning.",

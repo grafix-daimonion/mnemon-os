@@ -102,3 +102,36 @@ export async function markSuperseded(
   logEvent("class2.mark_superseded", { old_fact_id, new_fact_id, occurred_at, ok });
   return { ok };
 }
+
+// F-MNEMON-22 (E4): undo a supersession. Reopens the closed fact (valid_until=null,
+// superseded_by=null), restoring it to current-state. The host owns the judgment that
+// the original mark_superseded was wrong; Mnemon doesn't detect wrong supersessions,
+// it just gives the host an undo path. Audit-logged for review.
+// Returns { ok: false } if the fact wasn't actually superseded (idempotent miss).
+export async function unmarkSuperseded(
+  db: PGlite, fact_id: number,
+): Promise<{ ok: boolean; previously_superseded_by: number | null; previously_valid_until: string | null }> {
+  const prior = await db.query<{ superseded_by: number | null; valid_until: any }>(
+    `select superseded_by, valid_until from facts where id = $1`, [fact_id]);
+  if (!prior.rows.length) {
+    logEvent("class2.unmark_superseded", { fact_id, ok: false, reason: "fact not found" });
+    return { ok: false, previously_superseded_by: null, previously_valid_until: null };
+  }
+  const prev_sup = prior.rows[0].superseded_by;
+  const prev_until = prior.rows[0].valid_until;
+  if (prev_sup == null && prev_until == null) {
+    logEvent("class2.unmark_superseded", { fact_id, ok: false, reason: "fact was not superseded; no-op" });
+    return { ok: false, previously_superseded_by: null, previously_valid_until: null };
+  }
+  const r = await db.query(
+    `update facts set valid_until = null, superseded_by = null
+     where id = $1 returning id, valid_from`, [fact_id]);
+  if (!r.rows.length) {
+    logEvent("class2.unmark_superseded", { fact_id, ok: false, reason: "update returned no row" });
+    return { ok: false, previously_superseded_by: prev_sup, previously_valid_until: prev_until ? new Date(prev_until).toISOString() : null };
+  }
+  // Rebuild the Diary for the day the supersession had closed it (best-effort: today).
+  await buildDiary(db, new Date().toISOString());
+  logEvent("class2.unmark_superseded", { fact_id, ok: true, previously_superseded_by: prev_sup, previously_valid_until: prev_until ? new Date(prev_until).toISOString() : null });
+  return { ok: true, previously_superseded_by: prev_sup, previously_valid_until: prev_until ? new Date(prev_until).toISOString() : null };
+}

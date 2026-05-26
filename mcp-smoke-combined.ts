@@ -26,14 +26,15 @@ const text  = (r: any) => (r.content as any)[0].text as string;
 let pass = 0, fail = 0;
 const ok = (name: string, cond: boolean, extra = "") => { cond ? pass++ : fail++; console.log(`${cond ? "✓" : "✗"} ${name}${extra ? "  — " + extra : ""}`); };
 
-// 1. All 13 verbs registered
+// 1. All 14 verbs registered (4 Class-1 + 10 Class-2 incl. unmark_superseded from F-MNEMON-22)
 const tools = (await client.listTools()).tools.map((t) => t.name).sort();
 const expected = [
   "archive", "assert_fact", "find_entity", "history", "history_raw",
   "keyword_evidence", "mark_superseded", "read_diary", "recall",
   "recall_as_of", "recall_candidates", "remember", "resolve_or_create_entity",
+  "unmark_superseded",
 ].sort();
-ok(`all 13 verbs registered (${tools.length})`, JSON.stringify(tools) === JSON.stringify(expected), tools.join(","));
+ok(`all 14 verbs registered (${tools.length})`, JSON.stringify(tools) === JSON.stringify(expected), tools.join(","));
 
 // 2. Class-1 path: remember → server-side extract + QA
 const rem = text(await client.callTool({ name: "remember", arguments: { text: "Acme's contract renewal is in November." } }));

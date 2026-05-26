@@ -113,9 +113,12 @@ export async function recallCandidates(
     chunks.push({ content: r.content, source_occurred_at: toISO(r.source_occurred_at), source_interaction_id: r.source_interaction_id });
   }
   chunks.sort((a, b) => new Date(b.source_occurred_at).getTime() - new Date(a.source_occurred_at).getTime());
-  chunks.splice(6);
+  // CLASS2_DESIGN_v5 §4.1: chunk cap = min(limit, 6). Host token economics.
+  chunks.splice(Math.min(Math.max(1, limit), 6));
 
-  logEvent("class2.recall_candidates", { question, subject, as_of, facts: facts.length, chunks: chunks.length });
+  // Track subject-null fallback frequency (host's token-economics signal).
+  const subject_resolved = subject != null && subject !== "" && facts.length > 0;
+  logEvent("class2.recall_candidates", { question, subject, as_of, limit, subject_resolved, facts: facts.length, chunks: chunks.length });
   return { facts, chunks };
 }
 

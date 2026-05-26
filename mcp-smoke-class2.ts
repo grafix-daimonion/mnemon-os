@@ -26,9 +26,9 @@ const parse = (r: any) => JSON.parse((r.content as any)[0].text);
 let pass = 0, fail = 0;
 const ok = (name: string, cond: boolean, extra = "") => { cond ? pass++ : fail++; console.log(`${cond ? "✓" : "✗"} ${name}${extra ? "  — " + extra : ""}`); };
 
-// 1. list tools — all 9 must be present
+// 1. list tools — all 10 must be present (9 original + unmark_superseded from F-MNEMON-22)
 const tools = (await client.listTools()).tools.map((t) => t.name).sort();
-const expected = ["archive", "assert_fact", "find_entity", "history", "keyword_evidence", "mark_superseded", "read_diary", "recall_candidates", "resolve_or_create_entity"].sort();
+const expected = ["archive", "assert_fact", "find_entity", "history", "keyword_evidence", "mark_superseded", "read_diary", "recall_candidates", "resolve_or_create_entity", "unmark_superseded"].sort();
 ok(`tools listed (${tools.length})`, JSON.stringify(tools) === JSON.stringify(expected), tools.join(","));
 
 // 2. archive a turn
@@ -112,6 +112,21 @@ ok("recall_candidates (as_of May 26): November was current then", cand_then.fact
 const hist = parse(await client.callTool({ name: "history", arguments: { subject: "Acme" } }));
 ok("history: returns both facts", hist.facts.length === 2);
 ok("history: records the supersession", hist.supersessions.length === 1 && hist.supersessions[0].superseded_fact_id === fact.fact_id);
+
+// 12. F-MNEMON-22 — unmark_superseded: reopen the November fact
+const undo = parse(await client.callTool({ name: "unmark_superseded", arguments: { fact_id: fact.fact_id } }));
+ok("unmark_superseded: reopens the closed fact", undo.ok === true && undo.previously_superseded_by === fact2.fact_id);
+
+// 12b. After undo, BOTH November and December should be current → recall_candidates sees 2
+const cand_after_undo = parse(await client.callTool({
+  name: "recall_candidates",
+  arguments: { question: "When is Acme's contract renewal?", subject: "Acme" },
+}));
+ok("after unmark_superseded: both facts open as current", cand_after_undo.facts.length === 2, `${cand_after_undo.facts.length} facts`);
+
+// 12c. Idempotent: unmark_superseded on an already-open fact returns ok:false
+const noop = parse(await client.callTool({ name: "unmark_superseded", arguments: { fact_id: fact.fact_id } }));
+ok("unmark_superseded is idempotent (no-op on already-open)", noop.ok === false);
 
 await client.close();
 console.log(`\n${pass} passed, ${fail} failed`);
