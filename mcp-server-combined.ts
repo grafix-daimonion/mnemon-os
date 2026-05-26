@@ -64,8 +64,17 @@ server.registerTool("remember", {
 }, async ({ text, scope }) => {
   const n = async () => (await db.query<{ n: number }>(`select count(*)::int n from facts`)).rows[0].n;
   const before = await n();
-  await ingest(db, { content: text, speaker: "user", occurred_at: new Date().toISOString() }, { account: scope ?? null });
-  return say(`Remembered. (${(await n()) - before} fact(s) extracted.)`);
+  const result = await ingest(db, { content: text, speaker: "user", occurred_at: new Date().toISOString() }, { account: scope ?? null });
+  const persisted = (await n()) - before;
+  // Bridge fix per ASYNC_EXTRACTION_PLAN_v2 §10 — surface per-chunk + outer-loop failures.
+  // Visibility close for W-MNEMON-26 (was: silent count masked failures).
+  let msg = `Remembered. (${persisted} fact(s) from ${result.total_chunks} chunk(s)`;
+  if (result.failed_chunks > 0)
+    msg += `; ${result.failed_chunks} chunk(s) failed extraction — verbatim safe, retry possible`;
+  if (result.outer_error)
+    msg += `; pipeline error: ${result.outer_error.slice(0, 200)}`;
+  msg += ".)";
+  return say(msg);
 });
 
 server.registerTool("recall", {

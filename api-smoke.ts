@@ -50,8 +50,12 @@ const badAuth = await fetch(`${BASE}/health`, { headers: { authorization: "Beare
 ok("auth: bad bearer → 401", badAuth.status === 401);
 
 // 3. POST /remember (full ingest via Class-1 engine)
+// Bridge fix per ASYNC_EXTRACTION_PLAN_v2 §10: response now surfaces chunk-level state.
 const rem = await (await post("/remember", { text: "Acme's contract renewal is in November.", occurred_at: "2026-05-26T10:00:00Z" })).json() as any;
-ok("POST /remember → {ok:true}", rem.ok === true, JSON.stringify(rem));
+ok("POST /remember → {ok:true, persisted, total_chunks, failed_chunks, outer_error}",
+   rem.ok === true && typeof rem.persisted === "number" && typeof rem.total_chunks === "number"
+   && typeof rem.failed_chunks === "number" && (rem.outer_error === null || typeof rem.outer_error === "string"),
+   JSON.stringify(rem));
 
 // 4. POST /recall (current)
 const rec = await (await post("/recall", { question: "When is Acme's contract renewal?" })).json() as any;

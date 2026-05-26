@@ -67,12 +67,22 @@ Bun.serve({
       if (req.method === "POST" && url.pathname === "/remember") {
         const body = await readJson<{ text: string; speaker?: string | null; occurred_at?: string; account?: string | null }>(req);
         if (!body.text) return json({ error: "text required" }, 400);
-        await ingest(db, {
+        // Bridge fix per ASYNC_EXTRACTION_PLAN_v2 §10 — surface per-chunk + outer-loop failures.
+        const n = async () => (await db.query<{ n: number }>(`select count(*)::int n from facts`)).rows[0].n;
+        const before = await n();
+        const result = await ingest(db, {
           content: body.text,
           speaker: body.speaker ?? null,
           occurred_at: body.occurred_at ?? new Date().toISOString(),
         }, { account: body.account ?? null });
-        return json({ ok: true });
+        const persisted = (await n()) - before;
+        return json({
+          ok: true,
+          persisted,
+          total_chunks: result.total_chunks,
+          failed_chunks: result.failed_chunks,
+          outer_error: result.outer_error,
+        });
       }
 
       // POST /recall — current (omit as_of) or as-of (with as_of)

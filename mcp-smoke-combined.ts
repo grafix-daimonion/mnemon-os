@@ -37,8 +37,10 @@ const expected = [
 ok(`all 14 verbs registered (${tools.length})`, JSON.stringify(tools) === JSON.stringify(expected), tools.join(","));
 
 // 2. Class-1 path: remember → server-side extract + QA
+// Bridge fix per ASYNC_EXTRACTION_PLAN_v2 §10: return shape now surfaces chunk-level state.
+// Format: "Remembered. (N fact(s) from M chunk(s).)" or with "; J chunk(s) failed extraction…" if any failed.
 const rem = text(await client.callTool({ name: "remember", arguments: { text: "Acme's contract renewal is in November." } }));
-ok("Class-1 remember works (server-side LLM)", /Remembered\.\s*\(\d+ fact\(s\) extracted\.\)/.test(rem), rem.slice(0, 80));
+ok("Class-1 remember works (server-side LLM)", /Remembered\.\s*\(\d+ fact\(s\) from \d+ chunk\(s\)/.test(rem), rem.slice(0, 120));
 
 // 3. Class-1 recall returns the answer
 const rec = text(await client.callTool({ name: "recall", arguments: { question: "When is Acme's contract renewal?" } }));

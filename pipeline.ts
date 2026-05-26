@@ -169,7 +169,26 @@ export async function resolveOrCreate(
 // opt-out via MNEMON_EXTRACT_SEQUENTIAL=1 for installs hitting rate limits.
 const EXTRACT_MAX_CONCURRENCY = 8;
 
-export async function ingest(db: PGlite, it: Interaction, opts: IngestOpts = {}): Promise<void> {
+// Bridge fix per ASYNC_EXTRACTION_PLAN_v2 §10 + dev-review §8 (2026-05-27):
+// `ingest()` returns an IngestResult so the caller can surface per-chunk extract
+// failures and outer-pipeline errors to the user — closing the silent-loss trust gap
+// (W-MNEMON-26). Visibility is the close; data-layer quarantine state (Option C from
+// §10) is deferred to v6's synapsis_runs schema because facts.subject_id NOT NULL
+// blocks writing a quarantine fact row without an entity (would require a sentinel
+// or a schema change — out of bridge-fix scope).
+export interface IngestResult {
+  total_chunks: number;
+  failed_chunks: number;        // count of chunks whose extractFacts() threw
+  outer_error: string | null;   // non-extract failure post-loop (resolve / persist / QA / Diary)
+}
+
+// Per-chunk extract result is now a discriminated union — a failure can't be confused
+// with a legitimate "no facts found" `[]` (the v5 silent-loss vector).
+type ExtractResult =
+  | { chunk: { id: number; content: string }; facts: any[] }
+  | { chunk: { id: number; content: string }; error: string };
+
+export async function ingest(db: PGlite, it: Interaction, opts: IngestOpts = {}): Promise<IngestResult> {
   // 1. archive verbatim (append-only) — first, before anything that can fail.
   const ins = await db.query<{ id: number }>(
     `insert into interactions (content, speaker, occurred_at) values ($1, $2, $3) returning id`,
@@ -187,6 +206,11 @@ export async function ingest(db: PGlite, it: Interaction, opts: IngestOpts = {})
       [interactionId, i, pieces[i], vec]);
     chunkRecords.push({ id: r.rows[0].id, content: pieces[i] });
   }
+
+  // Bridge fix: track per-chunk and outer-loop failures so the caller can surface them
+  // (W-MNEMON-26). Visibility is the close; data-layer quarantine state deferred to v6.
+  let failedChunks = 0;
+  let outerError: string | null = null;
 
   // Verbatim + chunks are CONFIRMED at L0 above. Per-chunk extraction is best-effort; a flaky
   // LLM call on one chunk must NOT lose facts from other chunks (per-chunk failure isolation).
@@ -209,15 +233,16 @@ export async function ingest(db: PGlite, it: Interaction, opts: IngestOpts = {})
     //    Parallel by default (Promise.all in batches of EXTRACT_MAX_CONCURRENCY); sequential
     //    via MNEMON_EXTRACT_SEQUENTIAL=1 for rate-limit-sensitive installs.
     const sequential = process.env.MNEMON_EXTRACT_SEQUENTIAL === "1";
-    const perChunk: { chunk: { id: number; content: string }; facts: any[] }[] = [];
-    const extractOne = async (chunk: { id: number; content: string }) => {
+    const perChunk: ExtractResult[] = [];
+    const extractOne = async (chunk: { id: number; content: string }): Promise<ExtractResult> => {
       try {
         const facts = await extractFacts(chunk.content, it.speaker, interactionId, ctx);
         return { chunk, facts };
       } catch (e) {
-        // Per-chunk isolation: log, return empty, other chunks proceed.
+        // Per-chunk isolation: log + return DISCRIMINATED error (was `{chunk, facts: []}` —
+        // byte-identical to legitimate "no facts" which is the silent-loss vector).
         logEvent("ingest.chunk_extract_failed", { interaction_id: interactionId, chunk_id: chunk.id, error: String(e) });
-        return { chunk, facts: [] };
+        return { chunk, error: String(e) };
       }
     };
     if (sequential) {
@@ -230,7 +255,13 @@ export async function ingest(db: PGlite, it: Interaction, opts: IngestOpts = {})
     }
 
     // 4. Process each fact from each chunk — resolve, persist, QA-vs-chunk, supersession.
-    for (const { chunk, facts } of perChunk) {
+    //    Branch on the discriminated union: errored chunks are counted, not silently swallowed.
+    for (const result of perChunk) {
+      if ("error" in result) {
+        failedChunks++;
+        continue;
+      }
+      const { chunk, facts } = result;
       for (const ex of facts) {
         if (!ex?.subject || !ex?.predicate || ex?.object == null) continue; // malformed
         const shape = correctShape(String(ex.predicate), String(ex.shape ?? "single"));
@@ -316,8 +347,17 @@ export async function ingest(db: PGlite, it: Interaction, opts: IngestOpts = {})
     // 5. L5 Diary rebuild from CONFIRMED facts (deterministic, lossless, heavy-refs).
     await buildDiary(db, it.occurred_at);
   } catch (e) {
-    // Outer catch — only fires for non-extract failures (e.g. resolve/persist DB errors).
-    // Per-chunk extract failures are caught above and don't reach here.
-    logEvent("ingest.extract_failed", { interaction_id: interactionId, error: String(e) });
+    // Outer catch — only fires for non-extract failures (e.g. resolve/persist DB errors,
+    // faithful() throws, contradicts() throws, Diary build throws). Per-chunk extract
+    // failures are caught above and don't reach here.
+    // Bridge fix: capture the error string so the caller can surface it (was: silent log only).
+    outerError = String(e);
+    logEvent("ingest.extract_failed", { interaction_id: interactionId, error: outerError });
   }
+
+  return {
+    total_chunks: chunkRecords.length,
+    failed_chunks: failedChunks,
+    outer_error: outerError,
+  };
 }
