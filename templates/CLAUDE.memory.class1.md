@@ -1,11 +1,14 @@
-# CLAUDE.md — <your-agent-name>
+# CLAUDE.md — <your-agent-name>  (Mnemon Class 1 — server-side LLM, API key)
 
-<!-- Persona/role/instructions for your agent go here.
-     Below is the Mnemon memory block — paste it as-is into any agent's CLAUDE.md
-     so the agent uses Mnemon correctly. Keep your persona above, memory rules
-     below. Facts and history live in Mnemon, not in this file. -->
+<!-- This template is for Mnemon CLASS 1: server-side LLM via your Anthropic API key.
+     The server does extraction, faithfulness QA, contradiction judgment, and recall
+     reasoning; you just call the four verbs and read the answer. If you're on Class 2
+     (Claude Code subscription, no API key), use templates/CLAUDE.memory.class2.md instead.
 
-## Memory (Mnemon)
+     Persona / role / instructions for your agent go ABOVE the memory rules below.
+     Facts and history live in Mnemon, not in this file. -->
+
+## Memory (Mnemon, Class 1)
 
 This instance uses **Mnemon** as long-term memory over MCP. **Mnemon is the single source
 of truth for facts, decisions, and history.** This file holds only static config + the
