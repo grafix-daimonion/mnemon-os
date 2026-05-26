@@ -86,7 +86,10 @@ server.registerTool("recall_as_of", {
 }, async ({ question, as_of }) => say(fmtRecall(await recallAsOf(db, question, new Date(as_of).toISOString()))));
 
 server.registerTool("history", {
-  description: "Show how a subject's facts changed over time — current and superseded — as a human-readable timeline.",
+  description:
+    "Human-readable timeline projection: returns a FORMATTED STRING ('YYYY-MM-DD → YYYY-MM-DD: predicate = object', one fact per line). " +
+    "If you need structured data to process programmatically, use `history_raw` instead (returns {facts, supersessions} JSON). " +
+    "Same underlying data — different projections, different contracts; pick by what the caller will do with it.",
   inputSchema: { subject: z.string().describe("A person or org name.") },
 }, async ({ subject }) => {
   const rows = (await db.query<any>(
@@ -143,7 +146,10 @@ server.registerTool("keyword_evidence", {
 }, async ({ query, as_of }) => json(await keywordEvidence(db, query, as_of ?? null)));
 
 server.registerTool("history_raw", {
-  description: "Structured timeline for a subject: every fact ever asserted, ordered by valid_from, plus the supersession map (which fact closed which). Use 'history' for a human-readable view, this for programmatic processing.",
+  description:
+    "Structured JSON projection: returns {facts:[…], supersessions:[…]} — the host formats / summarizes. " +
+    "Counterpart to `history` (which returns formatted text). Same underlying data; pick `history_raw` when the caller needs " +
+    "to process or re-shape the data, `history` when the caller just wants to read a timeline. Not a superset — a different contract.",
   inputSchema: { subject: z.string() },
 }, async ({ subject }) => json(await historyClass2(db, subject)));
 
