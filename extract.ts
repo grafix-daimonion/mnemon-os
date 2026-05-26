@@ -50,7 +50,10 @@ Each fact = subject — predicate — object:
   supersedes the original.
 - predicate: a stable, stance-free label; reuse a known_predicate when it fits.
 - object + object_kind: another node ("entity", give object_type) OR a value/stance ("literal").
-- shape: "single" (one value at a time: a status/date/role) or "multi" (accumulates: a list).
+- shape: "single" (one value at a time: a status/date/role — a later value replaces the earlier)
+  vs "multi" (accumulates: a list — later values coexist with earlier). Use "multi" for
+  commitments/tasks/todos/responsibilities/ownerships (a person has many); use "single" for a
+  status/role/date/completion-state (one current value).
 - source_span: the exact substring supporting the fact.
 If no durable fact, return {facts:[]}.`;
 

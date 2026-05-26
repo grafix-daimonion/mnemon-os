@@ -3,7 +3,7 @@
 // typo merge) one LLM call, so run with the key in the environment (or a local .env):
 //   ANTHROPIC_API_KEY=sk-... bun run fuzzy-test.ts
 import { initDb } from "./db.ts";
-import { resolveOrCreate } from "./pipeline.ts";
+import { resolveOrCreate, correctShape } from "./pipeline.ts";
 import { osaDistance, fuzzyCap, normLabel, parseVersion, versionVerdict } from "./synapsis/fuzzy.ts";
 
 let pass = 0, fail = 0;
@@ -83,6 +83,16 @@ const alV2 = await resolveOrCreate(db4, "Alice v2", "person", null, now, 0);
 ok("version-rule (person): 'Alice v2' merges into 'Alice' (artifact)", alV2 === al, `#${alV2} vs #${al}`);
 
 await db2.close(); await db3.close(); await db4.close();
+
+// --- F-MNEMON-17: commitment fact-shape (pure correctShape) ---
+ok("shape: 'commitment' forced to multi (was single)", correctShape("commitment", "single") === "multi");
+ok("shape: 'commits to' forced to multi", correctShape("commits to", "single") === "multi");
+ok("shape: 'todo' forced to multi", correctShape("todo", "single") === "multi");
+ok("shape: 'responsible for' forced to multi", correctShape("responsible for", "single") === "multi");
+ok("shape: 'status' (genuinely single) stays single", correctShape("status", "single") === "single");
+ok("shape: 'wants to' (ambiguous) preserves LLM 'single'", correctShape("wants to", "single") === "single");
+ok("shape: any predicate respects LLM 'multi'", correctShape("anything", "multi") === "multi");
+ok("shape: case-insensitive predicate match", correctShape("  Commitment  ", "single") === "multi");
 
 await db.close();
 console.log(`\n${pass} passed, ${fail} failed`);

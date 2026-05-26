@@ -31,6 +31,26 @@ const toISO = (v: any): string => (v instanceof Date ? v.toISOString() : new Dat
 const INDEPENDENT = new Set(["person", "org"]);
 const OWNERSHIP_PREDS = ["has", "owns", "part of", "runs", "leads", "member of"];
 
+// Predicates whose facts ACCUMULATE (a person has many commitments, many tasks, many
+// responsibilities), so the LLM's "shape" must be forced to "multi" — never "single",
+// which would make a later commitment wrongly supersede an earlier one (commitment loss,
+// F-MNEMON-17). Ambiguous predicates like "wants to"/"plans to" are NOT here — they stay
+// LLM-decided (they can be either a new wish or a reversal of an earlier one).
+const ACCUMULATOR_PREDS = new Set([
+  "commitment", "commits to", "promised", "promise",
+  "task", "todo", "action item",
+  "responsible for", "works on",
+  // ownership preds — already multi by the extractor; included as a safety belt:
+  "has", "owns", "part of", "runs", "leads", "member of",
+]);
+
+// Force a predicate's shape to "multi" if it's a known accumulator; otherwise honour the
+// LLM's shape (default single). Pure + deterministic so it's unit-testable without DB/LLM.
+export function correctShape(predicate: string, llmShape: string): "single" | "multi" {
+  if (ACCUMULATOR_PREDS.has(String(predicate ?? "").toLowerCase().trim())) return "multi";
+  return llmShape === "multi" ? "multi" : "single";
+}
+
 // Promote an entity's type toward specificity — a known `org`/`project` is never demoted
 // back to the `"thing"` fallback once we've learned it. (Identity stays the label; the type
 // is just a soft descriptive tag that sharpens over time.)
@@ -168,7 +188,9 @@ export async function ingest(db: PGlite, it: Interaction, opts: IngestOpts = {})
 
   for (const ex of facts) {
     if (!ex?.subject || !ex?.predicate || ex?.object == null) continue; // skip malformed
-    const shape = ex.shape === "multi" ? "multi" : "single";
+    // Force shape=multi for known accumulator predicates (commitments, tasks, ownerships, …)
+    // — protects against the F-MNEMON-17 loss where a later commitment supersedes an earlier one.
+    const shape = correctShape(String(ex.predicate), String(ex.shape ?? "single"));
 
     // 4. resolve (identity = label): subject scoped to the account; object scoped to its owner
     const subjectId = await resolveOrCreate(db, String(ex.subject), ex.subject_type, accountId, it.occurred_at, interactionId, opts.account ?? null);
