@@ -9,6 +9,11 @@ layer with deterministic supersession.
 > measured on an eval harness, validated end-to-end on real transcripts, connected over
 > MCP, and packaged into four install paths (three classes + combined).
 
+> **Lineage.** This repo is the **single-Owner, open-source engine core** (the `v8` line in
+> the design history). The cloud-deployed and multi-tenant variants are tracked as separate
+> designs and are **not** part of this repo — so this is the document to read alongside the
+> code here.
+
 ## Quick start — `setup.ts` picks your install path
 
 Requires [Bun](https://bun.sh).
@@ -42,7 +47,7 @@ bun run mcp-smoke.ts                  # Class 1
 bun run mcp-smoke-class2.ts           # Class 2 (no API key needed)
 bun run mcp-smoke-combined.ts         # Combined (Class 1 + Class 2 in one process)
 bun run api-smoke.ts                  # Class 3 (HTTP)
-bun run fuzzy-test.ts                 # entity-resolution unit tests (must be 31/31)
+bun run fuzzy-test.ts                 # entity-resolution tests (must be 31/31; needs ANTHROPIC_API_KEY — exercises the LLM QA gate)
 ```
 
 ### First-run notes

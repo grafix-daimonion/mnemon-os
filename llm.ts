@@ -16,7 +16,12 @@ function loadKey(): string {
   throw new Error("ANTHROPIC_API_KEY not set (export it, or put it in a local .env).");
 }
 
-const client = new Anthropic({ apiKey: loadKey() });
+// Lazily constructed: paths that never call the LLM (Class-2 host-as-brain, pure
+// entity-resolution) must not require ANTHROPIC_API_KEY just to import this module.
+let _client: Anthropic | null = null;
+function getClient(): Anthropic {
+  return (_client ??= new Anthropic({ apiKey: loadKey() }));
+}
 // MNEMON_LLM_MODEL — per-install opt-in to a different Anthropic model (e.g. claude-sonnet-4-6).
 // Default: Haiku 4.5 (small + fast + cheap). For installs where extraction recall on
 // dense / multi-claim content matters (Betty), set MNEMON_LLM_MODEL=claude-sonnet-4-6.
@@ -24,7 +29,7 @@ const client = new Anthropic({ apiKey: loadKey() });
 const MODEL = process.env.MNEMON_LLM_MODEL?.trim() || "claude-haiku-4-5-20251001";
 
 export async function llmJSON(system: string, user: string): Promise<any> {
-  const resp = await client.messages.create({
+  const resp = await getClient().messages.create({
     model: MODEL,
     max_tokens: 600,
     system,
