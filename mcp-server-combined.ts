@@ -35,6 +35,9 @@ import { archive, assertFact, markSuperseded, unmarkSuperseded } from "./pipelin
 import { recallCandidates, keywordEvidence, history as historyClass2, readDiaryClass2 } from "./recall-class2.ts";
 import { findEntity, resolveOrCreateEntity } from "./entity-class2.ts";
 
+// Decoupling v2 — Z1 (verbatim capture) + re_extract (Z2 reprocess trigger).
+import { archiveTurn } from "./archive.ts";
+
 const DATA_DIR = process.env.MNEMON_DATA ?? join(homedir(), ".mnemon", "store");
 const db = await initDb(DATA_DIR);   // SINGLE attacher — one initDb call, one lock holder.
 
@@ -190,5 +193,57 @@ server.registerTool("resolve_or_create_entity", {
     ]).optional(),
   },
 }, async (args) => json(await resolveOrCreateEntity(db, args as any)));
+
+/* ─── Decoupling v2 verbs (Z1 capture + Z2 reprocess trigger) ─────────────────────────
+ * Per DECOUPLING_IMPL_SPEC_v2 §5.1 + §5.2. No LLM in either verb; both are fast.
+ * archive_turn: Z1 verbatim capture (chunks land at extraction_status='pending').
+ * re_extract:   reset chunks to 'pending' so synapsis-worker.ts (Z2) reprocesses them.
+ */
+
+server.registerTool("archive_turn", {
+  description:
+    "Z1 verbatim capture (decoupling v2): persist a turn + chunks + embeddings. NO LLM CALL. Returns immediately; " +
+    "chunks land at extraction_status='pending' for synapsis-worker.ts (Z2) to process asynchronously. " +
+    "Use this as the host-driven Z1 ingest path; legacy /save → ingest() retains the inline-extract behaviour.",
+  inputSchema: {
+    text: z.string().describe("The turn content."),
+    speaker: z.string().nullable().optional().describe("Speaker name (Owner / AI persona / arbitrary). NULL allowed."),
+    occurred_at: z.string().optional().describe("ISO8601 timestamp; defaults to server now()."),
+  },
+}, async ({ text, speaker, occurred_at }) =>
+  json(await archiveTurn(db, text, speaker ?? null, occurred_at ?? new Date().toISOString())));
+
+server.registerTool("re_extract", {
+  description:
+    "Reset chunks to extraction_status='pending' so synapsis-worker.ts (Z2) reprocesses them with the current " +
+    "extractor. Cheap iteration verb — re-extract over stored verbatim without re-capture. " +
+    "Scope: {interaction_id} (one interaction), {since: ISO8601} (chunks newer than), or {} (ALL chunks).",
+  inputSchema: {
+    interaction_id: z.number().optional(),
+    since: z.string().optional().describe("ISO8601 cutoff; reset chunks whose interaction.occurred_at >= since."),
+  },
+}, async ({ interaction_id, since }) => {
+  let r: { rows: { id: number }[] };
+  if (interaction_id != null) {
+    r = await db.query<{ id: number }>(
+      `update chunks set extraction_status = 'pending'
+        where interaction_id = $1 and extraction_status <> 'pending'
+        returning id`,
+      [interaction_id]);
+  } else if (since) {
+    r = await db.query<{ id: number }>(
+      `update chunks c set extraction_status = 'pending'
+         from interactions i
+        where c.interaction_id = i.id
+          and i.occurred_at >= $1
+          and c.extraction_status <> 'pending'
+        returning c.id`,
+      [since]);
+  } else {
+    r = await db.query<{ id: number }>(
+      `update chunks set extraction_status = 'pending' where extraction_status <> 'pending' returning id`);
+  }
+  return json({ chunks_reset: r.rows.length });
+});
 
 await server.connect(new StdioServerTransport());
