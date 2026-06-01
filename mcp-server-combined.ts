@@ -26,8 +26,8 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { initDb } from "./db.ts";
 
-// Class 1 (server-side LLM) — pulls in llm.ts → ANTHROPIC_API_KEY required at module load.
-import { ingest } from "./pipeline.ts";
+// Class 1 (server-side LLM) — pulls in llm.ts → ANTHROPIC_API_KEY required at module load
+// (still required because recall.ts → answerFromChunks() / answerFrom() call the LLM).
 import { recall, recallAsOf } from "./recall.ts";
 
 // Class 2 (no LLM in server) — independent of llm.ts.
@@ -57,27 +57,33 @@ const server = new McpServer({ name: "mnemon-combined", version: "1.0.0" });
 
 server.registerTool("remember", {
   description:
-    "Save a durable fact, decision, preference, or commitment THE USER asserted, to long-term memory. " +
-    "Use when the user states something worth remembering or says 'remember this'. " +
+    "Save a durable fact, decision, preference, or commitment to long-term memory. " +
+    "Decoupling v2: this performs Z1 verbatim capture (no LLM); synapsis-worker.ts (Z2) extracts " +
+    "facts asynchronously on its next poll (~2s). Returns immediately with the run_id; facts land " +
+    "shortly after. Use when the user states something worth remembering or says 'remember this'. " +
     "Record what the USER asserted — not your own suggestions. Re-saving is safe (deduped).",
   inputSchema: {
     text: z.string().describe("The fact/decision/preference, in the user's words."),
+    speaker: z.string().optional().describe(
+      "Who said it — Owner / a configured AI persona / a third party. Defaults to MNEMON_OWNER " +
+      "(then 'user' if env is unset). Lock 2 / Lock 4: the speaker drives identity sub-kind anchoring " +
+      "during Z2 extraction so Persona:AI / Person:Human aren't guessed."),
     scope: z.string().optional().describe("Optional owner/account this concerns (scopes ownership)."),
   },
-}, async ({ text, scope }) => {
-  const n = async () => (await db.query<{ n: number }>(`select count(*)::int n from facts`)).rows[0].n;
-  const before = await n();
-  const result = await ingest(db, { content: text, speaker: "user", occurred_at: new Date().toISOString() }, { account: scope ?? null });
-  const persisted = (await n()) - before;
-  // Bridge fix per ASYNC_EXTRACTION_PLAN_v2 §10 — surface per-chunk + outer-loop failures.
-  // Visibility close for W-MNEMON-26 (was: silent count masked failures).
-  let msg = `Remembered. (${persisted} fact(s) from ${result.total_chunks} chunk(s)`;
-  if (result.failed_chunks > 0)
-    msg += `; ${result.failed_chunks} chunk(s) failed extraction — verbatim safe, retry possible`;
-  if (result.outer_error)
-    msg += `; pipeline error: ${result.outer_error.slice(0, 200)}`;
-  msg += ".)";
-  return say(msg);
+}, async ({ text, speaker, scope }) => {
+  const effectiveSpeaker = speaker ?? process.env.MNEMON_OWNER ?? "user";
+  // Z1 capture only. Z2 (synapsis-worker.ts) processes on its next poll using
+  // MNEMON_OWNER + MNEMON_AI_PERSONAS env vars for the extractor context.
+  // The legacy inline-extract path (ingest()) is still reachable for tools that need
+  // sync extraction — call archive_turn directly + bun run synapsis-worker.ts once.
+  void scope; // scope is a Z2-time concern; not threaded through archive_turn in Phase 1 (§7.1 placement)
+  const r = await archiveTurn(db, text, effectiveSpeaker, new Date().toISOString());
+  return say(
+    `Captured (run_id=${r.run_id}, interaction_id=${r.interaction_id}). ` +
+    `${r.chunk_ids.length} chunk(s) staged at extraction_status='pending'. ` +
+    `synapsis-worker.ts (Z2) will extract on its next poll. ` +
+    `Recall returns via='verbatim_pending' until then.`,
+  );
 });
 
 server.registerTool("recall", {
