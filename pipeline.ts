@@ -24,11 +24,15 @@ export interface Interaction {
 
 export interface IngestOpts {
   account?: string | null; // the account/owner this conversation is about (scopes dependent entities)
+  owner?: string | null;   // Lock 2: the human Owner's name → anchored as Person:Human (not guessed)
+  aiPersonas?: string[];   // Lock 4: names that are AI agents/personas → anchored as Persona:AI
 }
 
 const toISO = (v: any): string => (v instanceof Date ? v.toISOString() : new Date(v).toISOString());
 
-const INDEPENDENT = new Set(["person", "org"]);
+const INDEPENDENT = new Set(["person", "org", "Person:Human", "Persona:AI"]);
+// Lock 4: identity sub-kinds — once an entity is a known Person/Persona, it is authoritative.
+const isIdentityKind = (t: string) => /^(Person|Persona):/.test((t ?? "").trim());
 const OWNERSHIP_PREDS = ["has", "owns", "part of", "runs", "leads", "member of"];
 
 // Predicates whose facts ACCUMULATE (a person has many commitments, many tasks, many
@@ -42,6 +46,9 @@ const ACCUMULATOR_PREDS = new Set([
   "responsible for", "works on",
   // ownership preds — already multi by the extractor; included as a safety belt:
   "has", "owns", "part of", "runs", "leads", "member of",
+  // feedback mind-facts (corrections/errors/praise) — each is a distinct lesson, so they ACCUMULATE
+  // and must never supersede one another, regardless of the shape the extractor returns.
+  "corrected", "erred", "hallucinated", "praised",
 ]);
 
 // Force a predicate's shape to "multi" if it's a known accumulator; otherwise honour the
@@ -61,6 +68,9 @@ async function promoteType(db: PGlite, id: number, currentType: string, incoming
   const inc = (incomingType || "thing").trim();
   const cur = (currentType || "thing").trim();
   if (inc === "thing" || inc === cur) return;
+  // Lock 4: an identity sub-kind (Person:Human / Persona:AI), once set, is authoritative —
+  // a later extractor guess must never demote it (e.g. Pythia: Persona:AI must not become "thing").
+  if (isIdentityKind(cur)) return;
   if (cur === "thing" || !cur) {
     await db.query(`update entities set type = $1 where id = $2`, [inc, id]);
     return;
@@ -215,17 +225,36 @@ export async function ingest(db: PGlite, it: Interaction, opts: IngestOpts = {})
   // Verbatim + chunks are CONFIRMED at L0 above. Per-chunk extraction is best-effort; a flaky
   // LLM call on one chunk must NOT lose facts from other chunks (per-chunk failure isolation).
   try {
+    // Lock 2: resolve the Owner + AI personas from opts (env as fallback) so identity is
+    // anchored deterministically, not guessed by the extractor.
+    const ownerName = opts.owner ?? process.env.MNEMON_OWNER ?? null;
+    const aiPersonas = opts.aiPersonas ??
+      (process.env.MNEMON_AI_PERSONAS?.split(",").map((s) => s.trim()).filter(Boolean)) ?? [];
+    const aiSet = new Set(aiPersonas.map((s) => normLabel(s)));
+    const isOwner = (name: string) => !!ownerName && normLabel(name) === normLabel(ownerName);
+
     // Owner scope for this conversation's dependent entities (explicit; Ownership v2 §7.1).
+    // Lock 2: when the account IS the Owner, it is a Person:Human — not the hardcoded 'org'.
+    const accountType = opts.account && isOwner(opts.account) ? "Person:Human" : "org";
     const accountId = opts.account
-      ? await resolveOrCreate(db, opts.account, "org", null, it.occurred_at, interactionId)
+      ? await resolveOrCreate(db, opts.account, accountType, null, it.occurred_at, interactionId)
       : null;
+
+    // Lock 4 + Lock 2: anchor the speaker's identity sub-kind before extraction so it is never
+    // guessed — the Owner is Person:Human; a configured AI persona is Persona:AI.
+    if (it.speaker) {
+      const spType = isOwner(it.speaker) ? "Person:Human"
+        : aiSet.has(normLabel(it.speaker)) ? "Persona:AI" : null;
+      if (spType) await resolveOrCreate(db, it.speaker, spType, accountId, it.occurred_at, interactionId, opts.account ?? null);
+    }
 
     // 2. Gather context once so all per-chunk extractions reuse, not re-mint.
     const ctxEntities = (await db.query<{ label: string; type: string }>(
       `select label, type from entities order by id desc limit 100`)).rows;
     const ctxPredicates = (await db.query<{ predicate: string }>(
       `select distinct predicate from facts limit 100`)).rows.map((r) => r.predicate);
-    const ctx = { entities: ctxEntities, predicates: ctxPredicates, account: opts.account ?? null };
+    const ctx = { entities: ctxEntities, predicates: ctxPredicates, account: opts.account ?? null,
+      owner: ownerName, ai_personas: aiPersonas };
 
     // 3. PER-CHUNK EXTRACTION (ENGINE_SPEC_v5 §2). Each chunk gets its own extract call;
     //    facts carry source_chunk_id by construction; failure is isolated per-chunk;

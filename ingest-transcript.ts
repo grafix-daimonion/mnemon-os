@@ -19,6 +19,9 @@ if (!file) {
 }
 const dataDir = flag("data") ?? `./data/${basename(file).replace(/\.[^.]+$/, "")}`;
 const account = flag("scope") ?? flag("account") ?? null; // scopes ownership of dependent entities
+const owner = flag("owner") ?? process.env.MNEMON_OWNER ?? null;                    // Lock 2: Owner → Person:Human
+const aiPersonas = (flag("personas") ?? process.env.MNEMON_AI_PERSONAS ?? "")       // Lock 4: names → Persona:AI
+  .split(",").map((s) => s.trim()).filter(Boolean);
 
 const SPEAKER = ["speaker", "role", "from", "author", "user", "name"];
 const TIME = ["timestamp", "time", "ts", "date", "datetime", "created_at", "sent_at"];
@@ -65,7 +68,9 @@ console.log(`Loaded ${turns.length} turns from ${file}` +
 const db = await initDb(dataDir);
 let n = 0;
 if (account) console.log(`Account scope: ${account}`);
-for (const t of turns) { await ingest(db, t, { account }); if (++n % 10 === 0) console.log(`  ingested ${n}/${turns.length}…`); }
+if (owner) console.log(`Owner (Person:Human): ${owner}`);
+if (aiPersonas.length) console.log(`AI personas (Persona:AI): ${aiPersonas.join(", ")}`);
+for (const t of turns) { await ingest(db, t, { account, owner, aiPersonas }); if (++n % 10 === 0) console.log(`  ingested ${n}/${turns.length}…`); }
 
 const one = async (sql: string) => (await db.query<{ n: number }>(sql)).rows[0].n;
 console.log(`\nDone. ${turns.length} turns → ${await one(`select count(*)::int n from facts`)} facts ` +
