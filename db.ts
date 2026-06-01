@@ -11,7 +11,7 @@
 import { PGlite } from "@electric-sql/pglite";
 import { vector } from "@electric-sql/pglite/vector";
 import postgres from "postgres";
-import { readFileSync, mkdirSync } from "node:fs";
+import { readFileSync, mkdirSync, existsSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -94,5 +94,49 @@ export async function initDb(dataDir?: string): Promise<Db> {
     }
   }
 
+  // Incremental migrations (one-shot, tracked in schema_migrations).
+  // Each migrations/NNN_*.sql runs exactly once per database, sorted by filename.
+  await runMigrations(db);
+
   return db;
+}
+
+/**
+ * Apply pending migrations from `migrations/*.sql` exactly once each.
+ * Each migration is recorded in `schema_migrations` on success; a failure aborts
+ * the run with the exception so we don't silently leave the schema partial.
+ */
+async function runMigrations(db: Db): Promise<void> {
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+      name       text PRIMARY KEY,
+      applied_at timestamptz NOT NULL DEFAULT now()
+    );
+  `);
+
+  const dir = join(__dirname, "migrations");
+  if (!existsSync(dir)) return;
+
+  const files = readdirSync(dir).filter((f) => f.endsWith(".sql")).sort();
+  for (const file of files) {
+    const name = file.replace(/\.sql$/, "");
+    const applied = await db.query<{ name: string }>(
+      `SELECT name FROM schema_migrations WHERE name = $1`,
+      [name],
+    );
+    if (applied.rows.length > 0) continue;
+
+    const body = readFileSync(join(dir, file), "utf8");
+    try {
+      await db.exec(body);
+      await db.query(
+        `INSERT INTO schema_migrations (name) VALUES ($1)`,
+        [name],
+      );
+      console.log(`  (migration) applied: ${name}`);
+    } catch (e: any) {
+      console.error(`  (migration) FAILED: ${name} — ${e.message}`);
+      throw e;
+    }
+  }
 }
