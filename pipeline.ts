@@ -192,11 +192,168 @@ export interface IngestResult {
   outer_error: string | null;   // non-extract failure post-loop (resolve / persist / QA / Diary)
 }
 
-// Per-chunk extract result is now a discriminated union — a failure can't be confused
-// with a legitimate "no facts found" `[]` (the v5 silent-loss vector).
-type ExtractResult =
-  | { chunk: { id: number; content: string }; facts: any[] }
-  | { chunk: { id: number; content: string }; error: string };
+/**
+ * Per-chunk processing context. Computed once per interaction in ingest() (or in Z2 by claim
+ * batch); reused for every extractChunk() call so neither path re-mints the LLM context.
+ */
+export interface ChunkContext {
+  /** the interaction this chunk belongs to */
+  interactionId: number;
+  speaker: string | null;
+  occurredAt: string;
+  /** explicit account/owner scope for resolving dependent entities */
+  account: string | null;
+  accountId: number | null;
+  /** LLM extraction context (passed straight to extractFacts) */
+  extractCtx: {
+    entities: { label: string; type: string }[];
+    predicates: string[];
+    account: string | null;
+    owner: string | null;
+    ai_personas: string[];
+  };
+}
+
+/**
+ * Result of processing a single chunk end-to-end (extract → resolve → persist → QA → contradiction).
+ * `status` mirrors `chunks.extraction_status` written by this function.
+ */
+export interface ExtractChunkResult {
+  chunk_id: number;
+  facts_persisted: number;
+  facts_quarantined: number;
+  status: "extracted" | "quarantined";
+  error?: string;
+}
+
+/**
+ * Per-chunk extraction body (DECOUPLING_IMPL_SPEC_v2 §10 Task 5 factor).
+ *
+ * Called once per chunk by ingest() (inline path) AND by Z2 synapsis-worker.ts (decoupled path).
+ * Encapsulates: LLM extract → per-fact resolve → persist provisional → faithfulness QA → contradiction.
+ *
+ * **Error isolation (A5)**: the try/catch lives INSIDE this function. A throw during extract or
+ * downstream processing for ONE chunk:
+ *   - is logged via `ingest.chunk_extract_failed`,
+ *   - sets `chunks.extraction_status = 'quarantined'` for that chunk,
+ *   - returns `{ status: 'quarantined', error: ... }` to the caller,
+ * and CANNOT propagate to other chunks in the caller's loop. Regression guard:
+ * `extractchunk-isolation-test.ts`.
+ */
+export async function extractChunk(
+  db: Db,
+  chunk: { id: number; content: string },
+  ctx: ChunkContext,
+): Promise<ExtractChunkResult> {
+  let factsPersisted = 0;
+  let factsQuarantined = 0;
+  try {
+    const facts = await extractFacts(chunk.content, ctx.speaker, ctx.interactionId, ctx.extractCtx);
+
+    for (const ex of facts) {
+      if (!ex?.subject || !ex?.predicate || ex?.object == null) continue; // malformed
+      const shape = correctShape(String(ex.predicate), String(ex.shape ?? "single"));
+
+      // 4a. Resolve (identity = label): subject under account; object under its owner.
+      const subjectId = await resolveOrCreate(
+        db, String(ex.subject), ex.subject_type, ctx.accountId, ctx.occurredAt,
+        ctx.interactionId, ctx.account);
+      let objectEntityId: number | null = null;
+      let objectLiteral: string | null = null;
+      if (ex.object_kind === "entity") {
+        const ownerForObject = OWNERSHIP_PREDS.includes(String(ex.predicate).toLowerCase()) ? subjectId : ctx.accountId;
+        objectEntityId = await resolveOrCreate(
+          db, String(ex.object), ex.object_type, ownerForObject, ctx.occurredAt,
+          ctx.interactionId, ctx.account);
+      } else {
+        objectLiteral = String(ex.object);
+      }
+
+      // self-loop guard
+      if (objectEntityId != null && objectEntityId === subjectId) {
+        logEvent("skip.selfloop", { subject: ex.subject, predicate: ex.predicate, object: ex.object });
+        continue;
+      }
+
+      // Cross-chunk-suspected heuristic (ENGINE_SPEC_v5 §18): if a fact's source_span exists
+      // verbatim in OTHER chunks of the same interaction but NOT in its producing chunk,
+      // it's a candidate cross-chunk reconstruction. Logged only; not blocking.
+      if (ex.source_span && typeof ex.source_span === "string" && ex.source_span.length > 8) {
+        const inChunk = chunk.content.includes(ex.source_span);
+        if (!inChunk) {
+          logEvent("extract.cross_chunk_suspected",
+            { interaction_id: ctx.interactionId, source_chunk_id: chunk.id, source_span: ex.source_span.slice(0, 120) });
+        }
+      }
+
+      // 4b. Persist as PROVISIONAL with source_chunk_id BY CONSTRUCTION (v5 §3 primary provenance).
+      const factIns = await db.query<{ id: number }>(
+        `insert into facts (subject_id, predicate, object_entity_id, object_literal, shape, valid_from,
+                            source_interaction_id, source_chunk_id, source_span, source_hash, status)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'provisional') returning id`,
+        [subjectId, ex.predicate, objectEntityId, objectLiteral, shape, ctx.occurredAt,
+         ctx.interactionId, chunk.id, ex.source_span ?? null, sourceHash(ex.source_span ?? String(ex.object))]);
+      const incoming: Fact = {
+        id: factIns.rows[0].id, subjectId, subjectLabel: String(ex.subject),
+        predicate: ex.predicate, object: String(ex.object), shape, validFrom: ctx.occurredAt,
+      };
+
+      // 4c. QA — faithfulness against THE PRODUCING CHUNK (v5 §4), not the whole turn.
+      const v = await faithful({ subject: String(ex.subject), predicate: ex.predicate, object: String(ex.object) }, chunk.content);
+      logEvent("qa", { fact_id: incoming.id, source_chunk_id: chunk.id, subject: ex.subject, predicate: ex.predicate, object: ex.object, supported: v.ok, reason: v.reason });
+      if (!v.ok) {
+        await db.query(`update facts set status = 'quarantined' where id = $1`, [incoming.id]);
+        if (!process.env.MNEMON_QUIET) console.log(`  ⚠ quarantined #${incoming.id} ("${ex.object}") — ${v.reason}`);
+        factsQuarantined++;
+        continue;
+      }
+      await db.query(`update facts set status = 'confirmed' where id = $1`, [incoming.id]);
+      factsPersisted++;
+
+      // 4d. Contradiction → current-state: close any open CONFIRMED fact this one supersedes.
+      const open = await db.query<any>(
+        `select f.id, f.predicate, f.object_literal, oe.label as object_entity_label, f.shape, f.valid_from
+         from facts f left join entities oe on oe.id = f.object_entity_id
+         where f.subject_id = $1 and f.valid_until is null and f.status = 'confirmed' and f.id <> $2`,
+        [subjectId, incoming.id]);
+      for (const row of open.rows) {
+        const existing: Fact = {
+          id: row.id, subjectId, subjectLabel: String(ex.subject),
+          predicate: row.predicate, object: row.object_literal ?? row.object_entity_label ?? "",
+          shape: row.shape, validFrom: toISO(row.valid_from),
+        };
+        const cv = await contradicts(incoming, existing);
+        logEvent("contradiction", {
+          subject: ex.subject,
+          incoming: { predicate: incoming.predicate, object: incoming.object },
+          existing: { predicate: existing.predicate, object: existing.object },
+          verdict: cv.contradicts, reason: cv.reason,
+        });
+        if (cv.contradicts) {
+          await db.query(`update facts set valid_until = $1, superseded_by = $2 where id = $3`,
+            [incoming.validFrom, incoming.id, existing.id]);
+          if (!process.env.MNEMON_QUIET)
+            console.log(`  ↳ superseded fact #${existing.id} ("${existing.object}") — ${cv.reason}`);
+        }
+      }
+    }
+
+    // Mark chunk as extracted — empty facts is legit (the extractor found nothing durable).
+    await db.query(`update chunks set extraction_status = 'extracted' where id = $1`, [chunk.id]);
+    return { chunk_id: chunk.id, facts_persisted: factsPersisted, facts_quarantined: factsQuarantined, status: "extracted" };
+  } catch (e: any) {
+    // A5 chunk-level isolation: per-chunk failure cannot propagate to other chunks.
+    const errStr = String(e?.message ?? e);
+    logEvent("ingest.chunk_extract_failed", { interaction_id: ctx.interactionId, chunk_id: chunk.id, error: errStr });
+    try {
+      await db.query(`update chunks set extraction_status = 'quarantined' where id = $1`, [chunk.id]);
+    } catch (dbErr: any) {
+      // Belt-and-braces: legacy store without the extraction_status column degrades to today's behavior.
+      logEvent("ingest.quarantine_write_failed", { chunk_id: chunk.id, error: String(dbErr?.message ?? dbErr) });
+    }
+    return { chunk_id: chunk.id, facts_persisted: 0, facts_quarantined: 0, status: "quarantined", error: errStr };
+  }
+}
 
 export async function ingest(db: Db, it: Interaction, opts: IngestOpts = {}): Promise<IngestResult> {
   // 1. archive verbatim (append-only) — first, before anything that can fail.
@@ -256,122 +413,31 @@ export async function ingest(db: Db, it: Interaction, opts: IngestOpts = {}): Pr
     const ctx = { entities: ctxEntities, predicates: ctxPredicates, account: opts.account ?? null,
       owner: ownerName, ai_personas: aiPersonas };
 
-    // 3. PER-CHUNK EXTRACTION (ENGINE_SPEC_v5 §2). Each chunk gets its own extract call;
-    //    facts carry source_chunk_id by construction; failure is isolated per-chunk;
-    //    smaller per-call LLM input closes the F-MNEMON-21 malformed-JSON failure mode.
-    //    Parallel by default (Promise.all in batches of EXTRACT_MAX_CONCURRENCY); sequential
-    //    via MNEMON_EXTRACT_SEQUENTIAL=1 for rate-limit-sensitive installs.
+    // 3. PER-CHUNK EXTRACTION — delegated to extractChunk() so Z2's standalone worker can reuse
+    //    the same per-chunk body verbatim (DECOUPLING_IMPL_SPEC_v2 §10 Task 5). Each chunk:
+    //    extract → resolve → persist provisional → faithfulness QA → contradiction. Per-chunk
+    //    failure isolation lives INSIDE extractChunk() (A5 regression guard:
+    //    extractchunk-isolation-test.ts). Parallel by default (Promise.all in batches of
+    //    EXTRACT_MAX_CONCURRENCY); sequential via MNEMON_EXTRACT_SEQUENTIAL=1.
     const sequential = process.env.MNEMON_EXTRACT_SEQUENTIAL === "1";
-    const perChunk: ExtractResult[] = [];
-    const extractOne = async (chunk: { id: number; content: string }): Promise<ExtractResult> => {
-      try {
-        const facts = await extractFacts(chunk.content, it.speaker, interactionId, ctx);
-        return { chunk, facts };
-      } catch (e) {
-        // Per-chunk isolation: log + return DISCRIMINATED error (was `{chunk, facts: []}` —
-        // byte-identical to legitimate "no facts" which is the silent-loss vector).
-        logEvent("ingest.chunk_extract_failed", { interaction_id: interactionId, chunk_id: chunk.id, error: String(e) });
-        return { chunk, error: String(e) };
-      }
+    const chunkCtx: ChunkContext = {
+      interactionId,
+      speaker: it.speaker,
+      occurredAt: it.occurred_at,
+      account: opts.account ?? null,
+      accountId,
+      extractCtx: ctx,
     };
+    const chunkResults: ExtractChunkResult[] = [];
     if (sequential) {
-      for (const chunk of chunkRecords) perChunk.push(await extractOne(chunk));
+      for (const c of chunkRecords) chunkResults.push(await extractChunk(db, c, chunkCtx));
     } else {
       for (let i = 0; i < chunkRecords.length; i += EXTRACT_MAX_CONCURRENCY) {
         const batch = chunkRecords.slice(i, i + EXTRACT_MAX_CONCURRENCY);
-        perChunk.push(...await Promise.all(batch.map(extractOne)));
+        chunkResults.push(...await Promise.all(batch.map((c) => extractChunk(db, c, chunkCtx))));
       }
     }
-
-    // 4. Process each fact from each chunk — resolve, persist, QA-vs-chunk, supersession.
-    //    Branch on the discriminated union: errored chunks are counted, not silently swallowed.
-    for (const result of perChunk) {
-      if ("error" in result) {
-        failedChunks++;
-        continue;
-      }
-      const { chunk, facts } = result;
-      for (const ex of facts) {
-        if (!ex?.subject || !ex?.predicate || ex?.object == null) continue; // malformed
-        const shape = correctShape(String(ex.predicate), String(ex.shape ?? "single"));
-
-        // 4a. Resolve (identity = label): subject under account; object under its owner.
-        const subjectId = await resolveOrCreate(db, String(ex.subject), ex.subject_type, accountId, it.occurred_at, interactionId, opts.account ?? null);
-        let objectEntityId: number | null = null;
-        let objectLiteral: string | null = null;
-        if (ex.object_kind === "entity") {
-          const ownerForObject = OWNERSHIP_PREDS.includes(String(ex.predicate).toLowerCase()) ? subjectId : accountId;
-          objectEntityId = await resolveOrCreate(db, String(ex.object), ex.object_type, ownerForObject, it.occurred_at, interactionId, opts.account ?? null);
-        } else {
-          objectLiteral = String(ex.object);
-        }
-
-        // self-loop guard
-        if (objectEntityId != null && objectEntityId === subjectId) {
-          logEvent("skip.selfloop", { subject: ex.subject, predicate: ex.predicate, object: ex.object });
-          continue;
-        }
-
-        // Cross-chunk-suspected heuristic (ENGINE_SPEC_v5 §18): if a fact's source_span exists
-        // verbatim in OTHER chunks of the same interaction but NOT in its producing chunk,
-        // it's a candidate cross-chunk reconstruction. Logged only; not blocking.
-        if (ex.source_span && typeof ex.source_span === "string" && ex.source_span.length > 8) {
-          const inChunk = chunk.content.includes(ex.source_span);
-          if (!inChunk) {
-            logEvent("extract.cross_chunk_suspected", { interaction_id: interactionId, source_chunk_id: chunk.id, source_span: ex.source_span.slice(0, 120) });
-          }
-        }
-
-        // 4b. Persist as PROVISIONAL with source_chunk_id BY CONSTRUCTION (v5 §3 primary provenance).
-        const factIns = await db.query<{ id: number }>(
-          `insert into facts (subject_id, predicate, object_entity_id, object_literal, shape, valid_from,
-                              source_interaction_id, source_chunk_id, source_span, source_hash, status)
-           values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'provisional') returning id`,
-          [subjectId, ex.predicate, objectEntityId, objectLiteral, shape, it.occurred_at,
-           interactionId, chunk.id, ex.source_span ?? null, sourceHash(ex.source_span ?? String(ex.object))]);
-        const incoming: Fact = {
-          id: factIns.rows[0].id, subjectId, subjectLabel: String(ex.subject),
-          predicate: ex.predicate, object: String(ex.object), shape, validFrom: it.occurred_at,
-        };
-
-        // 4c. QA — faithfulness against THE PRODUCING CHUNK (v5 §4), not the whole turn.
-        const v = await faithful({ subject: String(ex.subject), predicate: ex.predicate, object: String(ex.object) }, chunk.content);
-        logEvent("qa", { fact_id: incoming.id, source_chunk_id: chunk.id, subject: ex.subject, predicate: ex.predicate, object: ex.object, supported: v.ok, reason: v.reason });
-        if (!v.ok) {
-          await db.query(`update facts set status = 'quarantined' where id = $1`, [incoming.id]);
-          if (!process.env.MNEMON_QUIET) console.log(`  ⚠ quarantined #${incoming.id} ("${ex.object}") — ${v.reason}`);
-          continue;
-        }
-        await db.query(`update facts set status = 'confirmed' where id = $1`, [incoming.id]);
-
-        // 4d. Contradiction → current-state: close any open CONFIRMED fact this one supersedes.
-        const open = await db.query<any>(
-          `select f.id, f.predicate, f.object_literal, oe.label as object_entity_label, f.shape, f.valid_from
-           from facts f left join entities oe on oe.id = f.object_entity_id
-           where f.subject_id = $1 and f.valid_until is null and f.status = 'confirmed' and f.id <> $2`,
-          [subjectId, incoming.id]);
-        for (const row of open.rows) {
-          const existing: Fact = {
-            id: row.id, subjectId, subjectLabel: String(ex.subject),
-            predicate: row.predicate, object: row.object_literal ?? row.object_entity_label ?? "",
-            shape: row.shape, validFrom: toISO(row.valid_from),
-          };
-          const cv = await contradicts(incoming, existing);
-          logEvent("contradiction", {
-            subject: ex.subject,
-            incoming: { predicate: incoming.predicate, object: incoming.object },
-            existing: { predicate: existing.predicate, object: existing.object },
-            verdict: cv.contradicts, reason: cv.reason,
-          });
-          if (cv.contradicts) {
-            await db.query(`update facts set valid_until = $1, superseded_by = $2 where id = $3`,
-              [incoming.validFrom, incoming.id, existing.id]);
-            if (!process.env.MNEMON_QUIET)
-              console.log(`  ↳ superseded fact #${existing.id} ("${existing.object}") — ${cv.reason}`);
-          }
-        }
-      }
-    }
+    failedChunks = chunkResults.filter((r) => r.status === "quarantined" && r.error).length;
 
     // 5. L5 Diary rebuild from CONFIRMED facts (deterministic, lossless, heavy-refs).
     await buildDiary(db, it.occurred_at);
