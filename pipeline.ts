@@ -6,7 +6,7 @@
 //   - DEPENDENT entities (project/deadline/…) resolve OWNER-SCOPED — matched only within their
 //     owner's children, and CREATED with an owner edge (never orphaned).
 // Owner scope is supplied explicitly (the account/--scope); placement-by-inference is deferred (§7.1).
-import type { PGlite } from "@electric-sql/pglite";
+import type { Db } from "./db";
 import { extractFacts } from "./extract.ts";
 import { contradicts, type Fact } from "./synapsis/resolve.ts";
 import { logEvent } from "./logger.ts";
@@ -64,7 +64,7 @@ export function correctShape(predicate: string, llmShape: string): "single" | "m
 //   - specific A → specific B (conflict): last-writer-wins, logged as
 //     `entity.type_promotion_conflict` for audit. Caller (operator) can review.
 //   - Never demote to 'thing' (existing rule, kept).
-async function promoteType(db: PGlite, id: number, currentType: string, incomingType: string): Promise<void> {
+async function promoteType(db: Db, id: number, currentType: string, incomingType: string): Promise<void> {
   const inc = (incomingType || "thing").trim();
   const cur = (currentType || "thing").trim();
   if (inc === "thing" || inc === cur) return;
@@ -88,7 +88,7 @@ async function promoteType(db: PGlite, id: number, currentType: string, incoming
 //   4. no match                  → create       [independent=global; dependent=owner-scoped + edge]
 // `type` only decides how a GENUINELY-NEW node is created; it never forks an existing identity.
 export async function resolveOrCreate(
-  db: PGlite, label: string, type: string | undefined,
+  db: Db, label: string, type: string | undefined,
   ownerId: number | null, occurred_at: string, interactionId: number,
   account: string | null = null,
 ): Promise<number> {
@@ -198,7 +198,7 @@ type ExtractResult =
   | { chunk: { id: number; content: string }; facts: any[] }
   | { chunk: { id: number; content: string }; error: string };
 
-export async function ingest(db: PGlite, it: Interaction, opts: IngestOpts = {}): Promise<IngestResult> {
+export async function ingest(db: Db, it: Interaction, opts: IngestOpts = {}): Promise<IngestResult> {
   // 1. archive verbatim (append-only) — first, before anything that can fail.
   const ins = await db.query<{ id: number }>(
     `insert into interactions (content, speaker, occurred_at) values ($1, $2, $3) returning id`,

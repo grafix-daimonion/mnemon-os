@@ -8,7 +8,7 @@
 //   keywordEvidence(query, as_of?)                        → {has_evidence}
 //   history(subject)                                       → {facts, supersessions}
 //   readDiaryClass2(days?)                                 → {entries}
-import type { PGlite } from "@electric-sql/pglite";
+import type { Db } from "./db";
 import { embed, toVector } from "./embed.ts";
 import { readDiary } from "./diary.ts";
 import { logEvent } from "./logger.ts";
@@ -41,7 +41,7 @@ export interface ChunkCandidate {
 export interface CandidatesResult { facts: RecallCandidate[]; chunks: ChunkCandidate[]; }
 
 export async function recallCandidates(
-  db: PGlite, question: string,
+  db: Db, question: string,
   subject?: string | null, as_of?: string | null, limit: number = 10,
 ): Promise<CandidatesResult> {
   const facts: RecallCandidate[] = [];
@@ -124,7 +124,7 @@ export async function recallCandidates(
 
 // HONEST-EMPTY ARBITER — keyword-only by mandate. Never let an LLM (or vector noise) vote on absence.
 export async function keywordEvidence(
-  db: PGlite, query: string, as_of?: string | null,
+  db: Db, query: string, as_of?: string | null,
 ): Promise<{ has_evidence: boolean }> {
   const where = as_of ? `and i.occurred_at <= $2` : ``;
   const params = as_of ? [query, as_of] : [query];
@@ -137,7 +137,7 @@ export async function keywordEvidence(
 }
 
 export async function history(
-  db: PGlite, subject: string,
+  db: Db, subject: string,
 ): Promise<{ facts: any[]; supersessions: any[] }> {
   const ent = await db.query<{ id: number }>(`select id from entities where lower(label) = lower($1) limit 1`, [subject]);
   if (!ent.rows.length) return { facts: [], supersessions: [] };
@@ -163,7 +163,7 @@ export async function history(
   return { facts, supersessions };
 }
 
-export async function readDiaryClass2(db: PGlite, days: number = 3): Promise<{ entries: string[] }> {
+export async function readDiaryClass2(db: Db, days: number = 3): Promise<{ entries: string[] }> {
   const text = await readDiary(db, days);
   return { entries: [text] };
 }

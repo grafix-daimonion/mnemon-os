@@ -1,11 +1,11 @@
 // diary.ts — L5: the recent-tier digest. DETERMINISTIC + LOSSLESS (no LLM summary — the AAAK lesson):
 // it lists CONFIRMED current-state with inline facts + pointers (heavy-refs), regenerable from facts.
-import type { PGlite } from "@electric-sql/pglite";
+import type { Db } from "./db";
 
 const dateOf = (iso: string) => iso.slice(0, 10);
 
 // Rebuild the day's entry from CONFIRMED facts only (idempotent: delete+insert for the date).
-export async function buildDiary(db: PGlite, occurredAt: string): Promise<void> {
+export async function buildDiary(db: Db, occurredAt: string): Promise<void> {
   const date = dateOf(occurredAt);
   const added = (await db.query<any>(
     `select s.label as subject, f.predicate, coalesce(f.object_literal, oe.label) as object,
@@ -32,7 +32,7 @@ export async function buildDiary(db: PGlite, occurredAt: string): Promise<void> 
 }
 
 // The read-small tier: the last `days` digests, read whole (token-budget dial = days).
-export async function readDiary(db: PGlite, days = 3): Promise<string> {
+export async function readDiary(db: Db, days = 3): Promise<string> {
   const rows = (await db.query<{ d: string; content: string }>(
     `select to_char(entry_date, 'YYYY-MM-DD') as d, content from diary order by entry_date desc limit $1`,
     [days])).rows;

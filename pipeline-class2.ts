@@ -7,7 +7,7 @@
 //   archive(content, speaker, occurred_at)                       → {interaction_id, chunk_ids}
 //   assertFact({subject_id, predicate, object…, source_chunk_ids, …}) → {fact_id}
 //   markSuperseded(old_fact_id, new_fact_id, occurred_at)        → {ok}
-import type { PGlite } from "@electric-sql/pglite";
+import type { Db } from "./db";
 import { createHash } from "node:crypto";
 import { chunkText } from "./chunk.ts";
 import { embed, toVector } from "./embed.ts";
@@ -33,7 +33,7 @@ function correctShape(predicate: string, llmShape: string): "single" | "multi" {
 export interface ArchiveResult { interaction_id: number; chunk_ids: number[]; }
 
 export async function archive(
-  db: PGlite, content: string, speaker: string | null, occurred_at: string,
+  db: Db, content: string, speaker: string | null, occurred_at: string,
 ): Promise<ArchiveResult> {
   const ins = await db.query<{ id: number }>(
     `insert into interactions (content, speaker, occurred_at) values ($1, $2, $3) returning id`,
@@ -66,7 +66,7 @@ export interface AssertFactInput {
   confidence?: number;
 }
 
-export async function assertFact(db: PGlite, f: AssertFactInput): Promise<{ fact_id: number }> {
+export async function assertFact(db: Db, f: AssertFactInput): Promise<{ fact_id: number }> {
   if (!f.source_chunk_ids?.length)
     throw new Error("assert_fact requires at least one source_chunk_id (host must archive() the turn first)");
   // Apply the accumulator-predicate shape override (commitments/tasks/ownerships are 'multi').
@@ -90,7 +90,7 @@ export async function assertFact(db: PGlite, f: AssertFactInput): Promise<{ fact
 }
 
 export async function markSuperseded(
-  db: PGlite, old_fact_id: number, new_fact_id: number, occurred_at: string,
+  db: Db, old_fact_id: number, new_fact_id: number, occurred_at: string,
 ): Promise<{ ok: boolean }> {
   const r = await db.query(
     `update facts set valid_until = $1, superseded_by = $2
@@ -109,7 +109,7 @@ export async function markSuperseded(
 // it just gives the host an undo path. Audit-logged for review.
 // Returns { ok: false } if the fact wasn't actually superseded (idempotent miss).
 export async function unmarkSuperseded(
-  db: PGlite, fact_id: number,
+  db: Db, fact_id: number,
 ): Promise<{ ok: boolean; previously_superseded_by: number | null; previously_valid_until: string | null }> {
   const prior = await db.query<{ superseded_by: number | null; valid_until: any }>(
     `select superseded_by, valid_until from facts where id = $1`, [fact_id]);

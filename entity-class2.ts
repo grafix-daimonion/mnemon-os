@@ -7,7 +7,7 @@
 // Verbs exposed:
 //   findEntity(label, type?)                                  → {exact_id?, alias_id?, near_matches}
 //   resolveOrCreateEntity(label, type, owner_id?, decision?)  → {entity_id, created}
-import type { PGlite } from "@electric-sql/pglite";
+import type { Db } from "./db";
 import { normLabel, osaDistance, fuzzyCap, versionVerdict } from "./synapsis/fuzzy.ts";
 import { logEvent } from "./logger.ts";
 
@@ -22,7 +22,7 @@ export interface NearMatch {
 }
 export interface FindResult { exact_id?: number; alias_id?: number; near_matches: NearMatch[]; }
 
-export async function findEntity(db: PGlite, label: string, type?: string): Promise<FindResult> {
+export async function findEntity(db: Db, label: string, type?: string): Promise<FindResult> {
   const display = String(label).trim();
   const norm = normLabel(display);
   const t = (type ?? "thing").trim();
@@ -69,7 +69,7 @@ export interface ResolveInput {
 }
 
 export async function resolveOrCreateEntity(
-  db: PGlite, req: ResolveInput,
+  db: Db, req: ResolveInput,
 ): Promise<{ entity_id: number; created: boolean }> {
   const display = String(req.label).trim();
   const norm = normLabel(display);

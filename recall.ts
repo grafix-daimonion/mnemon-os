@@ -10,7 +10,7 @@
 // The LLM may say "no fact resolved" — it may NOT declare "there is nothing." That
 // verdict is the deterministic source scan (Step 4), grounding honest-empty in the
 // verbatim. Source mentions it but nothing resolved => "unresolved", never false-empty.
-import type { PGlite } from "@electric-sql/pglite";
+import type { Db } from "./db";
 import { llmJSON } from "./llm.ts";
 import { logEvent } from "./logger.ts";
 import { embed, toVector } from "./embed.ts";
@@ -45,7 +45,7 @@ async function subjectOf(question: string): Promise<string | null> {
 }
 
 // STEP 2 — SQL, one job: the bi-temporal selection of candidate facts.
-async function selectFacts(db: PGlite, subject: string, asOf: string | null): Promise<any[]> {
+async function selectFacts(db: Db, subject: string, asOf: string | null): Promise<any[]> {
   const ent = await db.query<{ id: number }>(
     `select id from entities where lower(label) = lower($1) limit 1`, [subject]);
   if (!ent.rows.length) return [];
@@ -99,7 +99,7 @@ EVEN IF worded differently (e.g. "team commitment to SSO deadline = will meet" a
 // STEP 4 — L0 FLOOR: keyword-search the verbatim chunks. This is both the absence arbiter AND a real
 // fallback answer when the fact layer missed — no clean subject required. (Vector search joins here
 // once the embedder lands.)
-async function searchChunks(db: PGlite, question: string, asOf: string | null): Promise<any[]> {
+async function searchChunks(db: Db, question: string, asOf: string | null): Promise<any[]> {
   // SEMANTIC half (vector) — catches paraphrase; relevance-gated so it doesn't return nearest-always.
   const qvec = toVector(await embed(question));
   const vWhere = asOf ? `and i.occurred_at <= $2` : ``;
@@ -133,7 +133,7 @@ async function searchChunks(db: PGlite, question: string, asOf: string | null): 
 
 // The CERTAIN absence arbiter (honest-empty spec): keyword scan over the verbatim. Vector noise gets
 // no vote on "there is nothing" — only the lexical scan can declare lexical absence.
-async function keywordHasEvidence(db: PGlite, question: string, asOf: string | null): Promise<boolean> {
+async function keywordHasEvidence(db: Db, question: string, asOf: string | null): Promise<boolean> {
   const where = asOf ? `and i.occurred_at <= $2` : ``;
   const params = asOf ? [question, asOf] : [question];
   const hit = await db.query(
@@ -156,7 +156,7 @@ async function answerFromChunks(question: string, chunks: any[]): Promise<{ answ
   };
 }
 
-async function run(db: PGlite, question: string, asOf: string | null): Promise<RecallResult> {
+async function run(db: Db, question: string, asOf: string | null): Promise<RecallResult> {
   // STEP 1
   const subject = await subjectOf(question);
   logEvent("recall.subject", { question, asOf, subject });
@@ -196,5 +196,5 @@ async function run(db: PGlite, question: string, asOf: string | null): Promise<R
     : { type: "honest_empty", reason: "no evidence in source" };
 }
 
-export const recall = (db: PGlite, q: string) => run(db, q, null);
-export const recallAsOf = (db: PGlite, q: string, asOf: string) => run(db, q, asOf);
+export const recall = (db: Db, q: string) => run(db, q, null);
+export const recallAsOf = (db: Db, q: string, asOf: string) => run(db, q, asOf);
