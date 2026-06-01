@@ -48,7 +48,7 @@ const ACCUMULATOR_PREDS = new Set([
   "has", "owns", "part of", "runs", "leads", "member of",
   // feedback mind-facts (corrections/errors/praise) — each is a distinct lesson, so they ACCUMULATE
   // and must never supersede one another, regardless of the shape the extractor returns.
-  "corrected", "erred", "hallucinated", "praised",
+  "received_correction", "erred", "hallucinated", "praised",
 ]);
 
 // Force a predicate's shape to "multi" if it's a known accumulator; otherwise honour the

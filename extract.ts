@@ -91,7 +91,7 @@ Tag each by lens: behavior | relationship | design | philosophy. Capture three k
 3. FEEDBACK on another participant (ONLY when explicitly marked — this is the signal that calibrates
    an agent). Each is a distinct lesson, so they ACCUMULATE:
    - correction (markers: "wrong", "no", "actually", "I meant", "correction") →
-     {subject:<the corrector>, predicate:"corrected", object:"<the fix> (was: <the error>)", shape:"multi"}
+     {subject:<the corrector>, predicate:"received_correction", object:"<the fix> (was: <the error>)", shape:"multi"}
    - error/hallucination flagged → {subject:<who erred>, predicate:"erred", object:"<what was wrong>", shape:"multi"}
    - praise (markers: "well done", "exactly", "perfect", "good call", "nice catch") →
      {subject:<the praiser>, predicate:"praised", object:"<the good reasoning praised>", shape:"multi"}
@@ -106,7 +106,7 @@ Rules:
 Example — note "Chatzi: From now on, always cite file:line. I like terse docs. Pythia, that was wrong — the owner is Person:Human, not org. Nice catch on the lazy client." →
   {subject:"Chatzi", subject_type:"Person:Human", predicate:"directive: always", object:"cite file:line in evidence", shape:"single", source_span:"From now on, always cite file:line"}
   {subject:"Chatzi", subject_type:"Person:Human", predicate:"design: prefers", object:"terse docs over verbose", shape:"single", source_span:"I like terse docs"}
-  {subject:"Chatzi", subject_type:"Person:Human", predicate:"corrected", object:"owner is Person:Human (was: org)", shape:"multi", source_span:"that was wrong — the owner is Person:Human, not org"}
+  {subject:"Chatzi", subject_type:"Person:Human", predicate:"received_correction", object:"owner is Person:Human (was: org)", shape:"multi", source_span:"that was wrong — the owner is Person:Human, not org"}
   {subject:"Chatzi", subject_type:"Person:Human", predicate:"praised", object:"Pythia's lazy-client fix", shape:"multi", source_span:"Nice catch on the lazy client"}
 
 If no durable fact, return {facts:[]}.`;
