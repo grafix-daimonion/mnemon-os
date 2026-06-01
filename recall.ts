@@ -24,9 +24,15 @@ export interface RecallResult {
   answer?: string;
   anchor?: string;
   source_occurred_at?: string;
-  // "fact" = current-state-resolved (the bi-temporal moat). "verbatim" = timestamped EVIDENCE from a
-  // chunk, NOT current-state-filtered — present it as "as of <date>…", may be superseded (Pythia QA-B).
-  via?: "fact" | "verbatim";
+  // 5-verdict surface (DECOUPLING_IMPL_SPEC_v2 §5.4 / Task 9; honest_empty stays a separate `type`):
+  //   "fact"                  current-state-resolved fact (the bi-temporal moat)
+  //   "verbatim"              chunk content, extraction_status='extracted', no fact resolved
+  //   "verbatim_pending"      chunk content, extraction_status='pending' — Z2 not done yet,
+  //                           the host should recommend "wait ~30s and ask again"
+  //   "verbatim_quarantined"  chunk content, extraction_status='quarantined' — Z2 ran but
+  //                           Faithfulness QA rejected the facts; verbatim is safe, manual
+  //                           re_extract is opt-in
+  via?: "fact" | "verbatim" | "verbatim_pending" | "verbatim_quarantined";
   reason?: string;
 }
 
@@ -105,7 +111,7 @@ async function searchChunks(db: Db, question: string, asOf: string | null): Prom
   const vWhere = asOf ? `and i.occurred_at <= $2` : ``;
   const vParams = asOf ? [qvec, asOf] : [qvec];
   const vres = await db.query<any>(
-    `select c.content, i.occurred_at as src_occurred_at
+    `select c.content, c.extraction_status, i.occurred_at as src_occurred_at
      from chunks c join interactions i on i.id = c.interaction_id
      where c.embedding is not null and (c.embedding <=> $1::vector) < ${VEC_MAX_DIST} ${vWhere}
      order by c.embedding <=> $1::vector limit 5`, vParams);
@@ -114,7 +120,7 @@ async function searchChunks(db: Db, question: string, asOf: string | null): Prom
   const kWhere = asOf ? `and i.occurred_at <= $2` : ``;
   const kParams = asOf ? [question, asOf] : [question];
   const kres = await db.query<any>(
-    `select c.content, i.occurred_at as src_occurred_at
+    `select c.content, c.extraction_status, i.occurred_at as src_occurred_at
      from chunks c join interactions i on i.id = c.interaction_id
      where to_tsvector('english', c.content) @@ plainto_tsquery('english', $1) ${kWhere}
      order by i.occurred_at desc limit 5`, kParams);
@@ -184,8 +190,15 @@ async function run(db: Db, question: string, asOf: string | null): Promise<Recal
     logEvent("recall.floor_pick", { index: fa.index, answer: fa.answer });
     if (fa.index >= 0 && fa.index < chunks.length && fa.answer && fa.answer.toLowerCase() !== "unknown") {
       const c = chunks[fa.index];
-      // floor answer = timestamped evidence, NOT current-state-resolved (no bi-temporal filter on chunks)
-      return { type: "answer", via: "verbatim", answer: fa.answer, anchor: c.content, source_occurred_at: toISO(c.src_occurred_at) };
+      // floor answer = timestamped evidence, NOT current-state-resolved (no bi-temporal filter on chunks).
+      // 5-verdict routing: read the chunk's extraction_status so the host knows whether Z2 is in flight
+      // (verbatim_pending), failed (verbatim_quarantined), or done (verbatim).
+      const status = String(c.extraction_status ?? "extracted");
+      const via: "verbatim" | "verbatim_pending" | "verbatim_quarantined" =
+        status === "pending"     ? "verbatim_pending" :
+        status === "quarantined" ? "verbatim_quarantined" :
+                                   "verbatim";
+      return { type: "answer", via, answer: fa.answer, anchor: c.content, source_occurred_at: toISO(c.src_occurred_at) };
     }
   }
   // ABSENCE verdict — decided by the CERTAIN keyword scan, never by vector noise (honest-empty spec).
