@@ -105,6 +105,33 @@ export async function commitmentVerdict(
   };
 }
 
+export interface OpenCommitment {
+  id: number;
+  owner: string;
+  about: string | null;
+  action: string;
+  due_at: string | null;
+  status: string;
+}
+
+// Open, confirmed commitments TO a recipient — the "what did we promise Acme, and by when?" query
+// the recipient FK exists to answer. Soonest-due first (overdue surfaces first), undated last.
+export async function commitmentsTo(db: Db, recipientId: number): Promise<OpenCommitment[]> {
+  const r = await db.query<any>(
+    `select c.id, o.label as owner, ab.label as about, c.action, c.due_at, c.status
+       from commitments c
+       join entities o on o.id = c.owner_id
+       left join entities ab on ab.id = c.about_id
+      where c.recipient_id = $1 and c.valid_until is null
+        and c.qa_status = 'confirmed' and c.status = 'open'
+      order by c.due_at asc nulls last, c.id asc`, [recipientId]);
+  return r.rows.map((row) => ({
+    id: row.id, owner: row.owner, about: row.about ?? null, action: row.action,
+    due_at: row.due_at ? (row.due_at instanceof Date ? row.due_at.toISOString() : new Date(row.due_at).toISOString()) : null,
+    status: row.status,
+  }));
+}
+
 // A reversal flips the matching current commitment's status (open → broken/fulfilled/cancelled),
 // on the SAME row, and RE-ANCHORS the status provenance to the reversal's own interaction so recall
 // cites the reversal ("can't make it"), not the original promise. Returns true if one matched.
