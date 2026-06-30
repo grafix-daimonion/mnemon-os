@@ -122,6 +122,29 @@ export async function recallCandidates(
   return { facts, chunks };
 }
 
+export interface FastRecallResult {
+  type: "answer" | "honest_empty";
+  facts: RecallCandidate[];
+  chunks: ChunkCandidate[];
+}
+
+// FAST PATH (Class-2, NO LLM) for automatic per-turn injection: the keyword arbiter gates honest-empty
+// (nothing matches → type honest_empty → the caller injects nothing), otherwise return the raw grounded
+// candidates for the host/agent to read. Milliseconds, not the seconds the LLM /recall costs. STUB.
+export async function recallFast(
+  db: Db, question: string, subject?: string | null, as_of?: string | null,
+): Promise<FastRecallResult> {
+  // 1. honest-empty gate (keyword-only, deterministic): if the verbatim has no lexical evidence,
+  //    inject NOTHING — the structural guarantee, now without an LLM on the critical path.
+  const ev = await keywordEvidence(db, question, as_of ?? null);
+  if (!ev.has_evidence) return { type: "honest_empty", facts: [], chunks: [] };
+  // 2. grounded candidates (facts in subject scope + matching verbatim chunks). The agent reads them.
+  const cand = await recallCandidates(db, question, subject ?? null, as_of ?? null, 8);
+  if (!cand.facts.length && !cand.chunks.length) return { type: "honest_empty", facts: [], chunks: [] };
+  logEvent("class2.recall_fast", { question, subject: subject ?? null, facts: cand.facts.length, chunks: cand.chunks.length });
+  return { type: "answer", facts: cand.facts, chunks: cand.chunks };
+}
+
 // HONEST-EMPTY ARBITER — keyword-only by mandate. Never let an LLM (or vector noise) vote on absence.
 export async function keywordEvidence(
   db: Db, query: string, as_of?: string | null,
