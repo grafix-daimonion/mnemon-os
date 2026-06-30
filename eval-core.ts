@@ -47,7 +47,9 @@ export async function runAllFixtures(): Promise<CaseOutcome[]> {
   const out: CaseOutcome[] = [];
   for (const f of FIXTURES) {
     const fx = JSON.parse(readFileSync(new URL(f, import.meta.url), "utf8"));
-    const db = await initDb();
+    // ephemeral: a fresh isolated in-memory store per fixture — never the user's MNEMON_PG_URL, and
+    // no cross-run accumulation (the old behaviour silently inflated counts like multi-accumulates).
+    const db = await initDb(undefined, { ephemeral: true });
     try {
       for (const it of fx.seed)
         await ingest(db, { content: it.content, speaker: it.speaker ?? null, occurred_at: it.occurred_at });
