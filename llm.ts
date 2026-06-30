@@ -5,6 +5,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { logEvent } from "./logger.ts";
 
 function loadKey(): string {
   if (process.env.ANTHROPIC_API_KEY) return process.env.ANTHROPIC_API_KEY.trim();
@@ -43,8 +44,13 @@ export async function llmJSON(system: string, user: string): Promise<any> {
   try {
     return JSON.parse(cleaned);
   } catch {
+    // Salvage a JSON object embedded in prose; if even that won't parse (e.g. a max_tokens
+    // truncation left it unbalanced), DEGRADE — return null rather than throw. Every caller
+    // guards with `j?.x`, so a bad response becomes "no answer", never an engine crash. A
+    // throw here would abort a whole ingest/recall on one malformed model reply.
     const m = cleaned.match(/\{[\s\S]*\}/);
-    if (m) return JSON.parse(m[0]);
-    throw new Error("LLM did not return JSON: " + cleaned.slice(0, 200));
+    if (m) { try { return JSON.parse(m[0]); } catch { /* fall through */ } }
+    logEvent("llm.unparseable_json", { preview: cleaned.slice(0, 200) });
+    return null;
   }
 }

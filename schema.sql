@@ -72,6 +72,39 @@ create table if not exists facts (
   created_at            timestamptz not null default now()
 );
 
+-- 3b. commitments — directed, deadline-bearing obligations (COMMITMENTS_DESIGN_v1).
+-- "owner owes recipient an action by due_at." A universal primitive (not CS-specific): the
+-- generic triple cannot hold the recipient/time/modality, and a commitment's reversal must flip
+-- ONE row's status rather than fight the accumulate-vs-supersede rule of `facts`. Reuses entities
+-- (owner/recipient/about) + interactions (provenance) + the bi-temporal/QA machinery of `facts`.
+create table if not exists commitments (
+  id                    bigserial   primary key,
+  owner_id              bigint      not null references entities(id),  -- who must act (the promiser)
+  recipient_id          bigint      references entities(id),           -- WHO IT'S TO (the slot a triple drops)
+  about_id              bigint      references entities(id),            -- the deal/thing it concerns
+  action                text        not null,                          -- "hit the SSO deadline" (verbatim)
+  due_at                timestamptz,                                   -- "by Friday" (nullable)
+  modality              text        not null default 'promise',        -- promise|will|intend|must
+  status                text        not null default 'open',           -- open|fulfilled|broken|cancelled
+  -- bi-temporal — same primitives as `facts`. status carries fulfilled/broken; valid_until closes
+  -- only on supersession (renegotiation) so a broken/fulfilled commitment stays the CURRENT record.
+  valid_from            timestamptz not null,
+  valid_until           timestamptz,                                   -- NULL = current record; set on renegotiation
+  superseded_by         bigint      references commitments(id),        -- "actually, make it Monday"
+  -- provenance — same contract as `facts`.
+  source_interaction_id bigint      not null references interactions(id),  -- provenance of the COMMITMENT
+  source_span           text,
+  source_chunk_id       bigint      references chunks(id),
+  -- provenance of the current STATUS (a reversal re-anchors these to its own interaction, so recall
+  -- cites "can't make it" (the reversal), not the original promise).
+  status_at             timestamptz,
+  status_source_interaction_id bigint references interactions(id),
+  status_source_span    text,
+  qa_status             text        not null default 'confirmed',      -- provisional|confirmed|quarantined
+  confidence            real        not null default 1.0,
+  created_at            timestamptz not null default now()
+);
+
 -- 4. diary — the read-small tier (today + ~3 days). Read whole, no retrieval.
 create table if not exists diary (
   id          bigserial   primary key,
@@ -107,6 +140,11 @@ create index if not exists facts_current  on facts (subject_id, predicate) where
 -- recall_as_of windowing.
 create index if not exists facts_validity on facts (valid_from, valid_until);
 
+-- commitments: the live commitment for an (owner, about) pair, and the "open promises to X" hot path.
+create index if not exists commitments_owner_about on commitments (owner_id, about_id) where valid_until is null;
+create index if not exists commitments_recipient    on commitments (recipient_id, due_at) where valid_until is null;
+create index if not exists commitments_validity     on commitments (valid_from, valid_until);
+
 -- L0 chunk retrieval: keyword + vector over the chunked verbatim (the floor).
 create index if not exists chunks_fts on chunks using gin (to_tsvector('english', content));
 create index if not exists chunks_vec on chunks using hnsw (embedding vector_cosine_ops);
@@ -122,3 +160,8 @@ alter table facts add column if not exists source_hash text;
 alter table facts add column if not exists status text not null default 'confirmed';
 alter table facts add column if not exists embedding vector(384);
 create index if not exists facts_vec on facts using hnsw (embedding vector_cosine_ops);
+
+-- Forward-compat for a commitments table created before the status-provenance columns existed.
+alter table commitments add column if not exists status_at timestamptz;
+alter table commitments add column if not exists status_source_interaction_id bigint references interactions(id);
+alter table commitments add column if not exists status_source_span text;
