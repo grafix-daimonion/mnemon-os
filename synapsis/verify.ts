@@ -35,13 +35,24 @@ If the policy doesn't fit (no version suffix, or the case is ambiguous), judge b
 export async function faithful(
   fact: { subject: string; predicate: string; object: string },
   sourceText: string,
+  speaker?: string | null,
 ): Promise<{ ok: boolean; reason: string }> {
   const j = await llmJSON(
     `You verify a memory FACT against the SOURCE text it was extracted from. Return JSON
 {supported: boolean, reason: string}.
 - supported=true if the source reasonably states or implies the fact (paraphrase is fine).
 - supported=false if the fact is invented, distorted, or about something the source doesn't say.
+- The source is spoken BY the speaker named below. First-person words in the source — "I", "me",
+  "my", "we", "our" — refer to that speaker. So a fact whose subject is the speaker's NAME is
+  supported by a first-person source statement; do NOT reject it merely because the source writes
+  "I" while the fact uses the speaker's name (they are the same person).
+- REPORTED SPEECH: when the speaker reports what a THIRD PARTY said, thinks, did, or committed to
+  ("Bob said X", "Alice now thinks Y", "they promised Z"), a fact whose subject is that third party
+  IS supported by the source. The speaker reporting it is HOW the fact entered memory; do NOT reject
+  a fact just because the speaker is relaying someone else's statement rather than asserting it
+  first-hand. "Bob said the migration ships in Q2" supports {Bob, committed to, migration} and
+  {migration, target date, Q2}.
 Be fair, not pedantic — a faithful paraphrase counts as supported.`,
-    JSON.stringify({ fact, source: sourceText }));
+    JSON.stringify({ fact, speaker: speaker ?? null, source: sourceText }));
   return { ok: !!j?.supported, reason: String(j?.reason ?? "") };
 }

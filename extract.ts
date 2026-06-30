@@ -25,6 +25,36 @@ export interface ExtractContext {
   ai_personas?: string[];       // names that are AI agents/personas → always Persona:AI (Lock 4)
 }
 
+// A directed obligation: "owner will do action (about thing, to recipient, by due)". Routed to the
+// commitments table, NOT the facts triple — the triple can't hold recipient/time/modality, and a
+// reversal must flip ONE row's status rather than fight the accumulate-vs-supersede rule of facts.
+export interface ExtractedCommitment {
+  owner: string;
+  owner_type?: string;
+  recipient?: string | null;
+  recipient_type?: string;
+  about?: string | null;
+  about_type?: string;
+  action: string;
+  due?: string | null;
+  modality?: string;
+  source_span: string;
+}
+
+// A later statement that an EARLIER commitment is now broken / fulfilled / cancelled.
+export interface ExtractedReversal {
+  owner: string;
+  about?: string | null;
+  status: "fulfilled" | "broken" | "cancelled";
+  source_span: string;
+}
+
+export interface ExtractResult {
+  facts: ExtractedFact[];
+  commitments: ExtractedCommitment[];
+  reversals: ExtractedReversal[];
+}
+
 const SYSTEM = `You extract durable facts from one note for a memory system. Return JSON {facts:[...]}.
 You are given CONTEXT — use it so the graph stays consistent:
 - known_entities: entities already stored (name + type). If the note refers to one of these, REUSE
@@ -109,14 +139,31 @@ Example — note "Chatzi: From now on, always cite file:line. I like terse docs.
   {subject:"Chatzi", subject_type:"Person:Human", predicate:"received_correction", object:"owner is Person:Human (was: org)", shape:"multi", source_span:"that was wrong — the owner is Person:Human, not org"}
   {subject:"Chatzi", subject_type:"Person:Human", predicate:"praised", object:"Pythia's lazy-client fix", shape:"multi", source_span:"Nice catch on the lazy client"}
 
-If no durable fact, return {facts:[]}.`;
+COMMITMENTS (emit in ADDITION to facts, in a separate 'commitments' array) — a commitment is a
+DIRECTED promise/agreement that someone WILL DO something, optionally by a time, optionally TO
+someone. "Alice confirmed her team will hit the SSO deadline", "Bob said the migration ships Q2",
+"I'll send you the report Friday" are commitments. Emit:
+  {owner:<who will act>, owner_type:<kind>, recipient?:<who it is promised TO>, about?:<the thing/deal
+   it concerns>, about_type?:<kind>, action:<what they will do>, due?:<when, free text ok>,
+   modality:"promise"|"will"|"intend"|"must", source_span:<exact words>}
+The owner is the party who must act (resolve a reported third party — "Bob said…" → owner Bob). REUSE
+known_entities for owner/about so a later reversal can match this commitment.
+
+REVERSALS (separate 'reversals' array) — when the note says an EARLIER commitment is now broken,
+won't be met, slipped, was cancelled, or was fulfilled/done/delivered. Emit:
+  {owner:<who>, about?:<the SAME thing the commitment was about, reusing its name even if reworded —
+   "API rollout" = "API migration">, status:"broken"|"fulfilled"|"cancelled", source_span:<exact words>}
+"can't make the SSO deadline" → {owner:Alice, about:"SSO deadline", status:"broken"}.
+"won't finish the API rollout in time" → {owner:Bob, about:"API migration", status:"broken"}.
+
+If no durable content, return {facts:[], commitments:[], reversals:[]}.`;
 
 export async function extractFacts(
   content: string,
   speaker: string | null,
   interactionId: number,
   ctx?: ExtractContext,
-): Promise<ExtractedFact[]> {
+): Promise<ExtractResult> {
   const context = ctx ?? { entities: [], predicates: [], account: null };
   const user = JSON.stringify({
     speaker: speaker ?? null,        // who is talking — the subject of any MIND-FACTS in this note
@@ -129,6 +176,8 @@ export async function extractFacts(
   });
   const out = await llmJSON(SYSTEM, user);
   const facts: ExtractedFact[] = Array.isArray(out?.facts) ? out.facts : [];
-  logEvent("extract", { interaction_id: interactionId, content, account: context.account, facts });
-  return facts;
+  const commitments: ExtractedCommitment[] = Array.isArray(out?.commitments) ? out.commitments : [];
+  const reversals: ExtractedReversal[] = Array.isArray(out?.reversals) ? out.reversals : [];
+  logEvent("extract", { interaction_id: interactionId, content, account: context.account, facts, commitments, reversals });
+  return { facts, commitments, reversals };
 }

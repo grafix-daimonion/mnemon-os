@@ -8,6 +8,7 @@
 // Owner scope is supplied explicitly (the account/--scope); placement-by-inference is deferred (§7.1).
 import type { Db } from "./db";
 import { extractFacts } from "./extract.ts";
+import { createCommitment, applyReversal } from "./commitments.ts";
 import { contradicts, type Fact } from "./synapsis/resolve.ts";
 import { logEvent } from "./logger.ts";
 import { chunkText } from "./chunk.ts";
@@ -29,6 +30,14 @@ export interface IngestOpts {
 }
 
 const toISO = (v: any): string => (v instanceof Date ? v.toISOString() : new Date(v).toISOString());
+
+// Parse a free-text due ("by Friday", "Q2", "2026-06-30") into an ISO timestamp, or null when it
+// isn't a concrete date. Keeps `commitments.due_at` (timestamptz) clean; fuzzy dues stay in `action`.
+function isoOrNull(v: any): string | null {
+  if (!v) return null;
+  const d = new Date(String(v));
+  return isNaN(d.getTime()) ? null : d.toISOString();
+}
 
 const INDEPENDENT = new Set(["person", "org", "Person:Human", "Persona:AI"]);
 // Lock 4: identity sub-kinds — once an entity is a known Person/Persona, it is authoritative.
@@ -248,7 +257,13 @@ export async function extractChunk(
   let factsPersisted = 0;
   let factsQuarantined = 0;
   try {
-    const facts = await extractFacts(chunk.content, ctx.speaker, ctx.interactionId, ctx.extractCtx);
+    // extractFacts may return ExtractedFact[] (today) or {facts, commitments, reversals} (once the
+    // prompt emits the new channels). Normalize so both shapes route — and so the existing
+    // array-returning test mocks keep working.
+    const extracted: any = await extractFacts(chunk.content, ctx.speaker, ctx.interactionId, ctx.extractCtx);
+    const facts = Array.isArray(extracted) ? extracted : (extracted?.facts ?? []);
+    const commitments = Array.isArray(extracted) ? [] : (extracted?.commitments ?? []);
+    const reversals = Array.isArray(extracted) ? [] : (extracted?.reversals ?? []);
 
     for (const ex of facts) {
       if (!ex?.subject || !ex?.predicate || ex?.object == null) continue; // malformed
@@ -299,7 +314,7 @@ export async function extractChunk(
       };
 
       // 4c. QA — faithfulness against THE PRODUCING CHUNK (v5 §4), not the whole turn.
-      const v = await faithful({ subject: String(ex.subject), predicate: ex.predicate, object: String(ex.object) }, chunk.content);
+      const v = await faithful({ subject: String(ex.subject), predicate: ex.predicate, object: String(ex.object) }, chunk.content, ctx.speaker);
       logEvent("qa", { fact_id: incoming.id, source_chunk_id: chunk.id, subject: ex.subject, predicate: ex.predicate, object: ex.object, supported: v.ok, reason: v.reason });
       if (!v.ok) {
         await db.query(`update facts set status = 'quarantined' where id = $1`, [incoming.id]);
@@ -336,6 +351,56 @@ export async function extractChunk(
             console.log(`  ↳ superseded fact #${existing.id} ("${existing.object}") — ${cv.reason}`);
         }
       }
+    }
+
+    // 4e. COMMITMENTS — directed obligations routed to their own table (COMMITMENTS_DESIGN_v1).
+    //   A new commitment → a row keyed on (owner, about); a reversal flips the matching row's status.
+    //   owner/recipient/about reuse the SAME entity resolver as facts, so paraphrase ("rollout" ≈
+    //   "migration") collapses to one `about` node and the reversal finds its commitment.
+    for (const c of commitments) {
+      if (!c?.owner || !c?.action) continue;
+      const ownerId = await resolveOrCreate(db, String(c.owner), c.owner_type, ctx.accountId, ctx.occurredAt, ctx.interactionId, ctx.account);
+      const recipientId = c.recipient
+        ? await resolveOrCreate(db, String(c.recipient), c.recipient_type, ctx.accountId, ctx.occurredAt, ctx.interactionId, ctx.account)
+        : null;
+      const aboutId = c.about
+        ? await resolveOrCreate(db, String(c.about), c.about_type, ctx.accountId, ctx.occurredAt, ctx.interactionId, ctx.account)
+        : null;
+      const cid = await createCommitment(db, {
+        ownerId, recipientId, aboutId, action: String(c.action), dueAt: isoOrNull(c.due),
+        modality: c.modality, validFrom: ctx.occurredAt, sourceInteractionId: ctx.interactionId,
+        sourceSpan: c.source_span ?? null, sourceChunkId: chunk.id,
+      });
+      // QA gate (mirror facts §4c): a commitment the source doesn't support is quarantined — kept for
+      // audit, but `qa_status != 'confirmed'` so it never drives recall (recall.ts filters confirmed).
+      const cv = await faithful(
+        { subject: String(c.owner), predicate: c.modality ? `commits to (${c.modality})` : "commits to", object: String(c.action) },
+        chunk.content, ctx.speaker);
+      if (!cv.ok) {
+        await db.query(`update commitments set qa_status = 'quarantined' where id = $1`, [cid]);
+        if (!process.env.MNEMON_QUIET) console.log(`  ⚠ quarantined commitment #${cid} ("${c.action}") — ${cv.reason}`);
+      }
+      logEvent("commitment.created", { id: cid, owner: c.owner, recipient: c.recipient ?? null, about: c.about ?? null, action: c.action, qa_supported: cv.ok });
+    }
+    for (const r of reversals) {
+      if (!r?.owner || !r?.status) continue;
+      // QA gate: an unsupported reversal must NOT flip a real commitment — verify before applying.
+      const rv = await faithful(
+        { subject: String(r.owner), predicate: `reversal: ${r.status}`, object: String(r.about ?? r.status) },
+        chunk.content, ctx.speaker);
+      if (!rv.ok) {
+        logEvent("commitment.reversal_quarantined", { owner: r.owner, about: r.about ?? null, status: r.status, reason: rv.reason });
+        continue;
+      }
+      const ownerId = await resolveOrCreate(db, String(r.owner), undefined, ctx.accountId, ctx.occurredAt, ctx.interactionId, ctx.account);
+      const aboutId = r.about
+        ? await resolveOrCreate(db, String(r.about), undefined, ctx.accountId, ctx.occurredAt, ctx.interactionId, ctx.account)
+        : null;
+      const matched = await applyReversal(db, {
+        ownerId, aboutId, status: r.status, at: ctx.occurredAt,
+        sourceInteractionId: ctx.interactionId, sourceSpan: r.source_span ?? null,
+      });
+      logEvent("commitment.reversal", { owner: r.owner, about: r.about ?? null, status: r.status, matched });
     }
 
     // Mark chunk as extracted — empty facts is legit (the extractor found nothing durable).

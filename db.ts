@@ -65,8 +65,11 @@ class PostgresDb implements Db {
  *
  * @param dataDir Only used by the PGLite path; ignored when MNEMON_PG_URL is set.
  */
-export async function initDb(dataDir?: string): Promise<Db> {
-  const pgUrl = process.env.MNEMON_PG_URL;
+export async function initDb(dataDir?: string, opts?: { ephemeral?: boolean }): Promise<Db> {
+  // ephemeral = a guaranteed-fresh, isolated in-memory store. Ignores BOTH MNEMON_PG_URL and dataDir
+  // so the eval/tests never touch (or accumulate state in) the user's real configured store —
+  // running fixtures against a persisted server Postgres silently corrupts the numbers run-over-run.
+  const pgUrl = opts?.ephemeral ? undefined : process.env.MNEMON_PG_URL;
   let db: Db;
 
   if (pgUrl) {
@@ -74,10 +77,11 @@ export async function initDb(dataDir?: string): Promise<Db> {
     const sql = postgres(pgUrl);
     db = new PostgresDb(sql);
   } else {
-    // PGLite (retained as local-degrade / eval path).
-    if (dataDir) mkdirSync(dataDir, { recursive: true });
+    // PGLite (retained as local-degrade / eval path). ephemeral forces in-memory (no dataDir).
+    const useDir = opts?.ephemeral ? undefined : dataDir;
+    if (useDir) mkdirSync(useDir, { recursive: true });
     const pglite = new PGlite(
-      dataDir ? { dataDir, extensions: { vector } } : { extensions: { vector } },
+      useDir ? { dataDir: useDir, extensions: { vector } } : { extensions: { vector } },
     );
     db = new PGliteDb(pglite);
   }
