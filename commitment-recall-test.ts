@@ -38,6 +38,15 @@ check("verdict re-anchored to the MAY reversal source", (v2?.anchor ?? "").inclu
 check("verdict occurred_at is the reversal date (May), not creation (March)",
   (v2?.source_occurred_at ?? "").startsWith("2026-05-12"), `occurred=${v2?.source_occurred_at}`);
 
+// AS-OF: before the reversal the commitment was still open. recall_as_of must reconstruct that.
+const vAsOf = await commitmentVerdict(db, alice, sso, "2026-04-01T00:00:00Z");
+check("as-of BEFORE the reversal answers yes (open back then)", vAsOf?.answer === "yes", `answer=${vAsOf?.answer}`);
+check("as-of verdict anchored to the March creation, not the May reversal",
+  (vAsOf?.source_occurred_at ?? "").startsWith("2026-03-10"), `occurred=${vAsOf?.source_occurred_at}`);
+// AS-OF before the commitment even existed → no verdict (honest).
+const vBefore = await commitmentVerdict(db, alice, sso, "2026-01-01T00:00:00Z");
+check("as-of BEFORE the commitment existed returns null", vBefore === null, `got=${JSON.stringify(vBefore)}`);
+
 await db.close();
 console.log(`\n${pass} pass | ${fail} fail`);
 process.exit(fail === 0 ? 0 : 1);

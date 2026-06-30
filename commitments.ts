@@ -76,18 +76,21 @@ export interface CommitmentVerdict {
   status: string;
 }
 
-// The current commitment's verdict for an (owner, about) pair: yes if it still stands
-// (open/fulfilled), no if it's broken/cancelled — anchored to the source of the CURRENT status
-// (the reversal, once one has flipped it).
+// A commitment's verdict for an (owner, about) pair: yes if it stands (open/fulfilled), no if
+// broken/cancelled. Bi-temporal: with `asOf` it reconstructs the PAST — a commitment was created
+// `open`, so before its single status transition (`status_at`) its as-of state was open, anchored to
+// the creation; at/after the transition the current status applies, anchored to the reversal. Without
+// `asOf` it returns the live status. Returns null if the commitment didn't exist yet as of `asOf`.
 export async function commitmentVerdict(
-  db: Db, ownerId: number, aboutId: number | null,
+  db: Db, ownerId: number, aboutId: number | null, asOf: string | null = null,
 ): Promise<CommitmentVerdict | null> {
-  const r = await db.query<{ status: string; anchor: string | null; occurred: any }>(
-    `select c.status,
-            i.content      as anchor,
-            i.occurred_at  as occurred
+  const r = await db.query<any>(
+    `select c.status, c.valid_from, c.status_at,
+            cs.content as create_anchor, cs.occurred_at as create_occurred,
+            ss.content as status_anchor, ss.occurred_at as status_occurred
        from commitments c
-       left join interactions i on i.id = c.status_source_interaction_id
+       left join interactions cs on cs.id = c.source_interaction_id
+       left join interactions ss on ss.id = c.status_source_interaction_id
       where c.owner_id = $1
         and (c.about_id = $2 or ($2 is null and c.about_id is null))
         and c.valid_until is null
@@ -96,13 +99,18 @@ export async function commitmentVerdict(
     [ownerId, aboutId]);
   const row = r.rows[0];
   if (!row) return null;
-  const answer = (row.status === "open" || row.status === "fulfilled") ? "yes" : "no";
-  return {
-    answer,
-    anchor: row.anchor ?? "",
-    source_occurred_at: row.occurred instanceof Date ? row.occurred.toISOString() : new Date(row.occurred).toISOString(),
-    status: row.status,
-  };
+
+  const t = (v: any) => (v instanceof Date ? v.toISOString() : new Date(v).toISOString());
+  // didn't exist yet as of the query time → no verdict.
+  if (asOf && new Date(t(row.valid_from)) > new Date(asOf)) return null;
+  // before the status transition, the commitment was still open.
+  const preTransition = !!asOf && !!row.status_at && new Date(asOf) < new Date(t(row.status_at));
+  const status = preTransition ? "open" : row.status;
+  const anchor = preTransition ? row.create_anchor : (row.status_anchor ?? row.create_anchor);
+  const occurred = preTransition ? row.create_occurred : (row.status_occurred ?? row.create_occurred);
+
+  const answer = (status === "open" || status === "fulfilled") ? "yes" : "no";
+  return { answer, anchor: anchor ?? "", source_occurred_at: t(occurred), status };
 }
 
 export interface OpenCommitment {

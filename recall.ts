@@ -14,6 +14,7 @@ import type { Db } from "./db";
 import { llmJSON } from "./llm.ts";
 import { logEvent } from "./logger.ts";
 import { embed, toVector } from "./embed.ts";
+import { commitmentVerdict } from "./commitments.ts";
 
 // Vector relevance gate: only chunks within this cosine distance count as a semantic hit. Looser →
 // catches more paraphrase but risks false-positive honest-empty; tighter → safer. [OPEN] tune on eval.
@@ -162,38 +163,40 @@ async function answerFromChunks(question: string, chunks: any[]): Promise<{ answ
   };
 }
 
-// COMMITMENT CHECK — for a current-state question ("did X agree?", "will X finish?"), a commitment's
-// live status is authoritative and shadows any stale "X committed to Y" fact. Current-state only:
-// recall_as_of uses the bi-temporal facts/verbatim path, which holds status history (the commitments
-// table mutates status in place). Returns a verdict, or null to fall through to facts.
-async function commitmentCheck(db: Db, subject: string, question: string): Promise<RecallResult | null> {
+// COMMITMENT CHECK — for a commitment question ("did X agree?", "will X finish?"), the commitment's
+// status is authoritative and shadows any stale "X committed to Y" fact. Bi-temporal: with `asOf` the
+// verdict reconstructs the past state (open before the reversal), so recall_as_of works too. Returns
+// a verdict, or null to fall through to facts/verbatim.
+async function commitmentCheck(db: Db, subject: string, question: string, asOf: string | null): Promise<RecallResult | null> {
   const ent = await db.query<{ id: number }>(
     `select id from entities where lower(label) = lower($1) limit 1`, [subject]);
   if (!ent.rows.length) return null;
+  // candidate commitments the owner had made BY asOf (so we don't offer a commitment from the future).
+  const asOfClause = asOf ? `and c.valid_from <= $2` : ``;
+  const params = asOf ? [ent.rows[0].id, asOf] : [ent.rows[0].id];
   const rows = (await db.query<any>(
-    `select c.action, c.status, ab.label as about,
-            i.content as anchor, i.occurred_at as occurred
+    `select c.about_id, ab.label as about, c.action
        from commitments c
        left join entities ab on ab.id = c.about_id
-       left join interactions i on i.id = c.status_source_interaction_id
-      where c.owner_id = $1 and c.valid_until is null and c.qa_status = 'confirmed'
-      order by c.valid_from desc`, [ent.rows[0].id])).rows;
+      where c.owner_id = $1 and c.valid_until is null and c.qa_status = 'confirmed' ${asOfClause}
+      order by c.valid_from desc`, params)).rows;
   if (!rows.length) return null;
 
   const list = rows.map((r, i) => ({ index: i, about: r.about, action: r.action }));
   const j = await llmJSON(
     `Each item is a COMMITMENT someone made ("will do <action>", about <thing>). The question asks
-whether such a commitment still stands. Pick the index of the commitment the question is about — the
-SAME topic counts even if worded differently ("API rollout" = "API migration"). Return JSON {index}.
+whether such a commitment stands. Pick the index of the commitment the question is about — the SAME
+topic counts even if worded differently ("API rollout" = "API migration"). Return JSON {index}.
 Use -1 ONLY if none of them concerns the question.`,
     JSON.stringify({ question, commitments: list }));
   const idx = Number.isInteger(j?.index) ? j.index : -1;
   if (idx < 0 || idx >= rows.length) return null;
 
-  const row = rows[idx];
-  const answer = (row.status === "open" || row.status === "fulfilled") ? "yes" : "no";
-  logEvent("recall.commitment", { subject, picked: row.about, status: row.status, answer });
-  return { type: "answer", via: "fact", answer, anchor: row.anchor ?? "", source_occurred_at: toISO(row.occurred) };
+  // the verdict (and its as-of reconstruction + anchor) is computed by the commitments module.
+  const v = await commitmentVerdict(db, ent.rows[0].id, rows[idx].about_id ?? null, asOf);
+  if (!v) return null;
+  logEvent("recall.commitment", { subject, picked: rows[idx].about, asOf, status: v.status, answer: v.answer });
+  return { type: "answer", via: "fact", answer: v.answer, anchor: v.anchor, source_occurred_at: v.source_occurred_at };
 }
 
 async function run(db: Db, question: string, asOf: string | null): Promise<RecallResult> {
@@ -201,9 +204,10 @@ async function run(db: Db, question: string, asOf: string | null): Promise<Recal
   const subject = await subjectOf(question);
   logEvent("recall.subject", { question, asOf, subject });
 
-  // STEP 1.5 — commitments are authoritative for current-state commitment questions (not as-of).
-  if (subject && !asOf && !process.env.MNEMON_NO_FACTS) {
-    const cv = await commitmentCheck(db, subject, question);
+  // STEP 1.5 — a commitment's status is authoritative for commitment questions (current AND as-of;
+  // the verdict reconstructs past state from status_at), shadowing any stale "X committed to Y" fact.
+  if (subject && !process.env.MNEMON_NO_FACTS) {
+    const cv = await commitmentCheck(db, subject, question, asOf);
     if (cv) return cv;
   }
 
