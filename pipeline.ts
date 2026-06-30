@@ -8,6 +8,7 @@
 // Owner scope is supplied explicitly (the account/--scope); placement-by-inference is deferred (§7.1).
 import type { Db } from "./db";
 import { extractFacts } from "./extract.ts";
+import { isPersonaPredicate, personaExtractionEnabled } from "./persona.ts";
 import { createCommitment, applyReversal } from "./commitments.ts";
 import { contradicts, type Fact } from "./synapsis/resolve.ts";
 import { logEvent } from "./logger.ts";
@@ -261,7 +262,10 @@ export async function extractChunk(
     // prompt emits the new channels). Normalize so both shapes route — and so the existing
     // array-returning test mocks keep working.
     const extracted: any = await extractFacts(chunk.content, ctx.speaker, ctx.interactionId, ctx.extractCtx);
-    const facts = Array.isArray(extracted) ? extracted : (extracted?.facts ?? []);
+    const rawFacts = Array.isArray(extracted) ? extracted : (extracted?.facts ?? []);
+    // GDPR gate (defense-in-depth — the extractor also omits the persona prompt when off): drop any
+    // persona/feedback fact unless persona extraction is explicitly enabled. World-facts pass through.
+    const facts = personaExtractionEnabled() ? rawFacts : rawFacts.filter((f: any) => !isPersonaPredicate(f?.predicate));
     const commitments = Array.isArray(extracted) ? [] : (extracted?.commitments ?? []);
     const reversals = Array.isArray(extracted) ? [] : (extracted?.reversals ?? []);
 

@@ -5,6 +5,7 @@
 // joined and updates land on the same node (which is what lets supersession fire).
 import { llmJSON } from "./llm.ts";
 import { logEvent } from "./logger.ts";
+import { personaExtractionEnabled, isPersonaPredicate } from "./persona.ts";
 
 export interface ExtractedFact {
   subject: string;
@@ -55,7 +56,7 @@ export interface ExtractResult {
   reversals: ExtractedReversal[];
 }
 
-const SYSTEM = `You extract durable facts from one note for a memory system. Return JSON {facts:[...]}.
+const SYSTEM_HEAD = `You extract durable facts from one note for a memory system. Return JSON {facts:[...]}.
 You are given CONTEXT — use it so the graph stays consistent:
 - known_entities: entities already stored (name + type). If the note refers to one of these, REUSE
   the exact name. Do NOT create a near-duplicate ("SSO rollout" vs "the SSO project").
@@ -98,9 +99,10 @@ Each fact = subject — predicate — object:
   vs "multi" (accumulates: a list — later values coexist with earlier). Use "multi" for
   commitments/tasks/todos/responsibilities/ownerships (a person has many); use "single" for a
   status/role/date/completion-state (one current value).
-- source_span: the exact substring supporting the fact.
+- source_span: the exact substring supporting the fact.`;
 
-SPEAKER MIND-FACTS — capture what shapes a PERSONA, not a transcript of moves (emit IN ADDITION
+// PERSONA (four-lens) — included in the prompt ONLY when persona extraction is enabled.
+const PERSONA_SECTION = `SPEAKER MIND-FACTS — capture what shapes a PERSONA, not a transcript of moves (emit IN ADDITION
 to the world-facts above, never instead). The note is spoken by the speaker field. Emit a mind-fact
 ONLY when the speaker reveals something DURABLE about how they think or want things done. Do NOT emit
 one-off conversational mechanics — asking a question, acknowledging, dispatching a task, a status
@@ -137,9 +139,9 @@ Example — note "Chatzi: From now on, always cite file:line. I like terse docs.
   {subject:"Chatzi", subject_type:"Person:Human", predicate:"directive: always", object:"cite file:line in evidence", shape:"single", source_span:"From now on, always cite file:line"}
   {subject:"Chatzi", subject_type:"Person:Human", predicate:"design: prefers", object:"terse docs over verbose", shape:"single", source_span:"I like terse docs"}
   {subject:"Chatzi", subject_type:"Person:Human", predicate:"received_correction", object:"owner is Person:Human (was: org)", shape:"multi", source_span:"that was wrong — the owner is Person:Human, not org"}
-  {subject:"Chatzi", subject_type:"Person:Human", predicate:"praised", object:"Pythia's lazy-client fix", shape:"multi", source_span:"Nice catch on the lazy client"}
+  {subject:"Chatzi", subject_type:"Person:Human", predicate:"praised", object:"Pythia's lazy-client fix", shape:"multi", source_span:"Nice catch on the lazy client"}`;
 
-COMMITMENTS (emit in ADDITION to facts, in a separate 'commitments' array) — a commitment is a
+const SYSTEM_TAIL = `COMMITMENTS (emit in ADDITION to facts, in a separate 'commitments' array) — a commitment is a
 DIRECTED promise/agreement that someone WILL DO something, optionally by a time, optionally TO
 someone. "Alice confirmed her team will hit the SSO deadline", "Bob said the migration ships Q2",
 "I'll send you the report Friday" are commitments. Emit:
@@ -158,6 +160,12 @@ won't be met, slipped, was cancelled, or was fulfilled/done/delivered. Emit:
 
 If no durable content, return {facts:[], commitments:[], reversals:[]}.`;
 
+// Assemble the system prompt, including the persona section only when enabled — so with persona OFF
+// the model is never even asked to profile people (the privacy-safe default).
+function buildSystem(includePersona: boolean): string {
+  return SYSTEM_HEAD + (includePersona ? "\n\n" + PERSONA_SECTION : "") + "\n\n" + SYSTEM_TAIL;
+}
+
 export async function extractFacts(
   content: string,
   speaker: string | null,
@@ -174,8 +182,10 @@ export async function extractFacts(
     known_predicates: context.predicates,
     note: `${speaker ? speaker + ": " : ""}${content}`,
   });
-  const out = await llmJSON(SYSTEM, user);
-  const facts: ExtractedFact[] = Array.isArray(out?.facts) ? out.facts : [];
+  const persona = personaExtractionEnabled();
+  const out = await llmJSON(buildSystem(persona), user);
+  let facts: ExtractedFact[] = Array.isArray(out?.facts) ? out.facts : [];
+  if (!persona) facts = facts.filter((f) => !isPersonaPredicate(f?.predicate)); // defense-in-depth
   const commitments: ExtractedCommitment[] = Array.isArray(out?.commitments) ? out.commitments : [];
   const reversals: ExtractedReversal[] = Array.isArray(out?.reversals) ? out.reversals : [];
   logEvent("extract", { interaction_id: interactionId, content, account: context.account, facts, commitments, reversals });

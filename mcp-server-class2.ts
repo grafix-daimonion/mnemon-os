@@ -13,7 +13,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { initDb } from "./db.ts";
 import { archive, assertFact, markSuperseded, unmarkSuperseded } from "./pipeline-class2.ts";
-import { recallCandidates, keywordEvidence, history, readDiaryClass2 } from "./recall-class2.ts";
+import { recallCandidates, keywordEvidence, recallFast, history, readDiaryClass2 } from "./recall-class2.ts";
 import { findEntity, resolveOrCreateEntity } from "./entity-class2.ts";
 
 const DATA_DIR = process.env.MNEMON_DATA ?? join(homedir(), ".mnemon", "store");
@@ -67,6 +67,11 @@ server.registerTool("keyword_evidence", {
   description: "HONEST-EMPTY arbiter — deterministic FTS over the verbatim. has_evidence=true means the query term appears somewhere (host should answer 'unresolved' if no fact resolved); false means genuinely no evidence (host says 'no record').",
   inputSchema: { query: z.string(), as_of: z.string().nullable().optional() },
 }, async ({ query, as_of }) => text(await keywordEvidence(db, query, as_of ?? null)));
+
+server.registerTool("recall_fast", {
+  description: "One-call deterministic recall for low-latency / automatic injection — combines keyword_evidence + recall_candidates, no LLM. Returns {type:'honest_empty'} (inject NOTHING — genuinely no record) OR {type:'answer', facts, chunks} (grounded candidates the host reads). The honest-empty gate is keyword-only, so absence is never fabricated.",
+  inputSchema: { question: z.string(), subject: z.string().nullable().optional(), as_of: z.string().nullable().optional() },
+}, async ({ question, subject, as_of }) => text(await recallFast(db, question, subject ?? null, as_of ?? null)));
 
 server.registerTool("history", {
   description: "Full timeline for a subject: every fact ever asserted, ordered by valid_from, plus the supersession map (which fact closed which). Deterministic — host reads + summarizes.",

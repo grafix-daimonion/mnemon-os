@@ -15,6 +15,7 @@ import { join } from "node:path";
 import { initDb } from "./db.ts";
 import { ingest } from "./pipeline.ts";
 import { recall, recallAsOf } from "./recall.ts";
+import { recallFast } from "./recall-class2.ts";
 
 const DATA_DIR = process.env.MNEMON_DATA ?? join(homedir(), ".mnemon", "store");
 const PORT = parseInt(process.env.MNEMON_HTTP_PORT ?? "7777", 10);
@@ -91,6 +92,14 @@ Bun.serve({
         if (!body.question) return json({ error: "question required" }, 400);
         const r = body.as_of ? await recallAsOf(db, body.question, body.as_of) : await recall(db, body.question);
         return json(r);
+      }
+
+      // POST /recall_fast — deterministic, NO-LLM recall for automatic per-turn injection.
+      // Keyword-arbiter honest-empty + raw grounded candidates (facts + chunks). Milliseconds.
+      if (req.method === "POST" && url.pathname === "/recall_fast") {
+        const body = await readJson<{ question: string; subject?: string | null; as_of?: string }>(req);
+        if (!body.question) return json({ error: "question required" }, 400);
+        return json(await recallFast(db, body.question, body.subject ?? null, body.as_of ?? null));
       }
 
       // GET /history?subject=… — stream of facts (current + superseded) for a subject
