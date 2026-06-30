@@ -371,10 +371,27 @@ export async function extractChunk(
         modality: c.modality, validFrom: ctx.occurredAt, sourceInteractionId: ctx.interactionId,
         sourceSpan: c.source_span ?? null, sourceChunkId: chunk.id,
       });
-      logEvent("commitment.created", { id: cid, owner: c.owner, recipient: c.recipient ?? null, about: c.about ?? null, action: c.action });
+      // QA gate (mirror facts §4c): a commitment the source doesn't support is quarantined — kept for
+      // audit, but `qa_status != 'confirmed'` so it never drives recall (recall.ts filters confirmed).
+      const cv = await faithful(
+        { subject: String(c.owner), predicate: c.modality ? `commits to (${c.modality})` : "commits to", object: String(c.action) },
+        chunk.content, ctx.speaker);
+      if (!cv.ok) {
+        await db.query(`update commitments set qa_status = 'quarantined' where id = $1`, [cid]);
+        if (!process.env.MNEMON_QUIET) console.log(`  ⚠ quarantined commitment #${cid} ("${c.action}") — ${cv.reason}`);
+      }
+      logEvent("commitment.created", { id: cid, owner: c.owner, recipient: c.recipient ?? null, about: c.about ?? null, action: c.action, qa_supported: cv.ok });
     }
     for (const r of reversals) {
       if (!r?.owner || !r?.status) continue;
+      // QA gate: an unsupported reversal must NOT flip a real commitment — verify before applying.
+      const rv = await faithful(
+        { subject: String(r.owner), predicate: `reversal: ${r.status}`, object: String(r.about ?? r.status) },
+        chunk.content, ctx.speaker);
+      if (!rv.ok) {
+        logEvent("commitment.reversal_quarantined", { owner: r.owner, about: r.about ?? null, status: r.status, reason: rv.reason });
+        continue;
+      }
       const ownerId = await resolveOrCreate(db, String(r.owner), undefined, ctx.accountId, ctx.occurredAt, ctx.interactionId, ctx.account);
       const aboutId = r.about
         ? await resolveOrCreate(db, String(r.about), undefined, ctx.accountId, ctx.occurredAt, ctx.interactionId, ctx.account)

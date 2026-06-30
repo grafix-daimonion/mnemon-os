@@ -22,6 +22,14 @@ mock.module("./extract.ts", () => ({
   },
 }));
 
+// This test isolates ROUTING, not the QA gate — accept all faithfulness checks so the marker-content
+// ("COMMIT"/"REVERSE") isn't rejected. Faithfulness behaviour is covered by commitment-qa-test.ts.
+mock.module("./synapsis/verify.ts", () => ({
+  faithful: async () => ({ ok: true, reason: "mock-accept" }),
+  sameEntity: async () => ({ ok: false, reason: "mock-no-merge" }),
+  sourceHash: (_s: string) => "mockhash",
+}));
+
 const { initDb } = await import("./db.ts");
 const { ingest } = await import("./pipeline.ts");
 
