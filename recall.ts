@@ -39,9 +39,15 @@ export interface RecallResult {
 
 const toISO = (v: any): string => (v instanceof Date ? v.toISOString() : new Date(v).toISOString());
 
-// Predicates that mean "this is the subject's" — walked when gathering candidates, so a question
-// about an owner reaches facts on the things it owns (Acme -> contract -> renewal date).
-const TRAVERSAL_PREDS = ["has", "owns", "part of", "runs", "leads", "member of", "responsible for", "works on"];
+// Predicates that mean "this edge leads to the subject's thing" — walked when gathering candidates,
+// so a question about a person reaches facts on the referent (Acme -> contract -> renewal date;
+// Bob -committed to-> API migration -target date-> Q2). Ownership edges + COMMITMENT edges: a
+// commitment TO a referent is, for traversal, a link to it — otherwise an as-of question about a
+// commitment goes blind when the fallback facts path runs and extraction labeled the edge
+// "committed to" instead of "responsible for" (the paraphrase-reversal-asof flake). The commitments
+// TABLE is still the primary path (commitmentCheck, STEP 1.5); this only hardens the fallback.
+const TRAVERSAL_PREDS = ["has", "owns", "part of", "runs", "leads", "member of", "responsible for", "works on",
+  "committed to", "commits to", "commitment", "promised", "promise", "agreed to", "pledged to"];
 
 // STEP 1 — LLM, one job: name the subject.
 async function subjectOf(question: string): Promise<string | null> {
@@ -51,8 +57,8 @@ async function subjectOf(question: string): Promise<string | null> {
   return j?.subject ?? null;
 }
 
-// STEP 2 — SQL, one job: the bi-temporal selection of candidate facts.
-async function selectFacts(db: Db, subject: string, asOf: string | null): Promise<any[]> {
+// STEP 2 — SQL, one job: the bi-temporal selection of candidate facts. (exported for unit testing)
+export async function selectFacts(db: Db, subject: string, asOf: string | null): Promise<any[]> {
   const ent = await db.query<{ id: number }>(
     `select id from entities where lower(label) = lower($1) limit 1`, [subject]);
   if (!ent.rows.length) return [];
