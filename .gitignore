@@ -1,0 +1,9 @@
+node_modules/
+data/
+logs/
+*.log
+
+# Secrets — NEVER commit. ANTHROPIC_API_KEY lives here (chmod 600).
+.env
+.env.*
+!.env.example

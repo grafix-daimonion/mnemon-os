@@ -1,0 +1,6 @@
+[
+  { "speaker": "Customer", "timestamp": "2026-02-03T10:00:00Z", "text": "We're planning to roll out SSO to all users by the end of Q1." },
+  { "speaker": "CSM", "timestamp": "2026-02-03T10:01:30Z", "text": "Noted — I'll record the Q1 SSO rollout target. Who's leading it on your side?" },
+  { "speaker": "Customer", "timestamp": "2026-02-03T10:02:00Z", "text": "Dana is leading the rollout, with support from the IT team." },
+  { "speaker": "Customer", "timestamp": "2026-03-20T14:00:00Z", "text": "Update: we've decided to push the SSO rollout to Q2 — IT is short-staffed this quarter." }
+]

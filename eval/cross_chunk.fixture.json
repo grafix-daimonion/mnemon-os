@@ -1,0 +1,26 @@
+{
+  "name": "cross_chunk",
+  "description": "Per-chunk extraction (ENGINE_SPEC_v5 §2) may miss facts spanning a non-overlap chunk boundary. The chunker (~800/100) puts an ~100-char overlap between adjacent chunks; this fixture verifies that (a) a fact whose source span sits inside the overlap region is recoverable, and (b) when the fact is split outside the overlap, the verbatim floor (L0) still surfaces it via `via:'verbatim'` rather than honest-empty. The `extract.cross_chunk_suspected` logEvent (§18) instruments occurrences for monitoring.",
+  "today": "2026-05-26",
+
+  "seed": [
+    {
+      "occurred_at": "2026-05-26T09:00:00Z",
+      "speaker": "user",
+      "content": "Long preamble to push the chunk boundary near the key fact. Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum. Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit. The Acme contract renewal date is November 15."
+    }
+  ],
+
+  "cases": [
+    {
+      "id": "cross-chunk-recall-current",
+      "verb": "recall",
+      "query": "When is Acme's contract renewal?",
+      "expect": {
+        "answer": "november",
+        "quote_contains": "November 15",
+        "rationale": "Even if the producing chunk straddled the 800-char boundary, the ~100-char overlap should let one chunk's extract lift the fact. If not, the verbatim floor (L0) must surface it via `via:'verbatim'` — never honest-empty."
+      }
+    }
+  ]
+}
